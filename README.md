@@ -63,7 +63,11 @@ RUN_MODE=probe   python main.py   # sonde megafilter uniquement
 
 ## Pipeline
 
-1. **Collecte** — `new_pools` (p. 1-10), `trending_pools` (p. 1-5), `pools` (p. 1-10).
+1. **Collecte** — 9 sources, 71 appels (~2,5 min de throttle) :
+   `trending_pools` sur les 4 durees (5m, 1h, 6h, 24h), p. 1-5 chacune ;
+   `pools?sort=h24_volume_usd_desc`, p. 1-10 ; puis les pools de chaque DEX
+   retenu, meme tri, p. 1-10. Jamais de page > 10 : la pagination au dela
+   est reservee aux plans payants et le client refuse l'appel.
 2. **Deduplication par mint**, pas par pool : un token a souvent plusieurs
    pools, on garde le plus liquide.
 3. **Exclusion du bruit** : SOL, wSOL, USDC, USDT et les LST (JitoSOL, mSOL,
@@ -107,6 +111,37 @@ Les deux sont ecrites en base pour permettre de comparer leur distribution
 sur donnees reelles avant de fixer `WINNER_MULTIPLE`. `perf_x_launch` est
 calculee des qu'elle est calculable, y compris quand `perf_x` ne l'est pas.
 
+## Pourquoi cette topologie de collecte
+
+Mesure du run du 17/09, sur 500 pools collectes :
+
+| Source | Age median | Verdict |
+| --- | --- | --- |
+| `new_pools` | 0,0 j | aucun pool ne peut atteindre la fenetre |
+| `pools` (tri par defaut `h24_tx_count_desc`) | 0,4 j | idem |
+| `trending_pools` | 28,6 j | seule source dans la fenetre |
+
+403 des 500 pools partaient en `age_trop_jeune`, 51 en `age_trop_vieux`, et
+**aucun** en liquidite ou volume. Le goulot etait la collecte, pas les
+seuils — qui n'ont donc pas ete touches.
+
+D'ou les trois changements : `new_pools` retire (il reviendra pour une
+logique d'accumulation), `pools` trie par volume plutot que par nombre de
+transactions (le volume favorise les pools etablies, donc plus agees), et
+les 4 durees de `trending_pools` interrogees separement.
+
+Les identifiants de DEX **ne sont pas codes en dur** : `resolve_dexes()`
+appelle `/networks/solana/dexes` au demarrage et ne retient que les ids
+reellement presents dans la reponse. Un DEX souhaite mais absent est ignore
+avec un log ; si l'id simple manque mais qu'une variante existe
+(`meteora` -> `meteora-dlmm`), la variante est retenue et signalee. Si
+l'appel echoue, la collecte par DEX est desactivee pour le run et les autres
+sources continuent.
+
+La deduplication par mint devient critique ici : les 9 sources se recoupent
+largement. Le pool le plus liquide de chaque token est conserve, les autres
+sont comptes en `doublon_pool`.
+
 ## Lire l'entonnoir de collecte
 
 Chaque run logue une ligne par source avec l'age median des pools retournes,
@@ -141,7 +176,8 @@ ecrit `NULL`, jamais `0`, pour ne pas fausser la calibration.
 ## Contraintes de conception
 
 - **Rate limit** : 2,1 s minimum entre deux appels. La cle Demo est plafonnee
-  a 30 req/min et **partagee** avec un autre service.
+  a 30 req/min et **partagee** avec l'agent ETH. Ne pas reduire l'intervalle :
+  la collecte coute 71 appels, plus un appel OHLCV par candidat retenu.
 - **Pertes explicites** : tout appel abandonne apres retries logue
   `PERTE : <endpoint> abandonne apres N tentatives` et retourne `None`. Jamais
   de liste vide silencieuse.

@@ -106,14 +106,27 @@ def get(endpoint: str, params: dict[str, Any] | None = None) -> dict | None:
 
 PoolPage = tuple[list[dict], list[dict]]
 
+# La pagination au dela de la page 10 est reservee aux plans payants et
+# renvoie une erreur : on refuse l'appel plutot que de le gaspiller.
+MAX_PAGE = 10
 
-def _pool_list(endpoint: str, page: int) -> PoolPage | None:
+
+def _pool_list(
+    endpoint: str, page: int, extra: dict[str, Any] | None = None
+) -> PoolPage | None:
     """(pools, tokens inclus) pour une page. None = perte, jamais [] muet.
 
     include=base_token ramene les symboles dans le meme appel : pas de
     requete supplementaire par token.
     """
-    payload = get(endpoint, {"page": page, "include": "base_token"})
+    if not 1 <= page <= MAX_PAGE:
+        raise ValueError(
+            f"page={page} hors bornes : l'API n'accepte que 1..{MAX_PAGE} "
+            "sur le plan Demo."
+        )
+    params: dict[str, Any] = {"page": page, "include": "base_token"}
+    params.update(extra or {})
+    payload = get(endpoint, params)
     if payload is None:
         return None
     data = payload.get("data")
@@ -125,18 +138,47 @@ def _pool_list(endpoint: str, page: int) -> PoolPage | None:
 
 
 def new_pools(page: int = 1) -> PoolPage | None:
-    """Pools les plus recemment crees. None = perte, [] = vraie page vide."""
+    """Pools les plus recemment crees. None = perte, [] = vraie page vide.
+
+    Hors collecte depuis le run du 17/09 : age median 0,0 j, aucun pool ne
+    peut atteindre la fenetre MIN_POOL_AGE_DAYS. Conserve pour une future
+    logique d'accumulation.
+    """
     return _pool_list(f"/networks/{NETWORK}/new_pools", page)
 
 
-def trending_pools(page: int = 1) -> PoolPage | None:
-    """Pools en tendance. None = perte, [] = vraie page vide."""
-    return _pool_list(f"/networks/{NETWORK}/trending_pools", page)
+def trending_pools(page: int = 1, duration: str | None = None) -> PoolPage | None:
+    """Pools en tendance. duration : 5m, 1h, 6h ou 24h (defaut API : 24h)."""
+    extra = {"duration": duration} if duration else None
+    return _pool_list(f"/networks/{NETWORK}/trending_pools", page, extra)
 
 
-def top_pools(page: int = 1) -> PoolPage | None:
-    """Top pools du reseau. None = perte, [] = vraie page vide."""
-    return _pool_list(f"/networks/{NETWORK}/pools", page)
+def top_pools(page: int = 1, sort: str | None = None) -> PoolPage | None:
+    """Top pools du reseau. sort par defaut cote API : h24_tx_count_desc."""
+    extra = {"sort": sort} if sort else None
+    return _pool_list(f"/networks/{NETWORK}/pools", page, extra)
+
+
+def dex_pools(dex: str, page: int = 1, sort: str | None = None) -> PoolPage | None:
+    """Top pools d'un DEX donne."""
+    extra = {"sort": sort} if sort else None
+    return _pool_list(f"/networks/{NETWORK}/dexes/{dex}/pools", page, extra)
+
+
+def dexes(page: int = 1) -> list[dict] | None:
+    """DEX disponibles sur le reseau. None = perte.
+
+    Sert a resoudre les identifiants reellement exposes par l'API plutot
+    que d'en coder en dur.
+    """
+    payload = get(f"/networks/{NETWORK}/dexes", {"page": page})
+    if payload is None:
+        return None
+    data = payload.get("data")
+    if not isinstance(data, list):
+        log.error("PERTE : /networks/%s/dexes - payload inattendu", NETWORK)
+        return None
+    return data
 
 
 def ohlcv_day(pool_address: str, limit: int = 60) -> list[list] | None:

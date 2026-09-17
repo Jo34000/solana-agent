@@ -14,7 +14,8 @@ import logging
 import os
 import statistics
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from functools import partial
+from typing import Any, Callable, Iterable
 
 import geckoterminal as gt
 import supabase_client as db
@@ -23,6 +24,7 @@ from config import (
     MAX_POOL_AGE_DAYS,
     MIN_LIQUIDITY_USD,
     MIN_POOL_AGE_DAYS,
+    MIN_REQUEST_INTERVAL_S,
     MIN_VOLUME_24H_USD,
     WINNER_MULTIPLE,
     diagnose_environment,
@@ -35,9 +37,26 @@ log = logging.getLogger("solana-agent")
 # donne rien (constate sur ETH avec 7 winners).
 WINNERS_TARGET = 50
 
-NEW_POOLS_PAGES = 10
+# Topologie de collecte, calibree sur le run du 17/09 : new_pools (age median
+# 0,0 j) et le tri par defaut de /pools (h24_tx_count_desc, 0,4 j) ne
+# produisaient que des pools trop jeunes pour la fenetre. 403 des 500 pools
+# collectes etaient rejetes en age_trop_jeune.
 TRENDING_POOLS_PAGES = 5
 TOP_POOLS_PAGES = 10
+DEX_POOLS_PAGES = 10
+
+# Les quatre durees sont interrogees separement : c'est la seule source qui
+# tombait dans la fenetre (age median 28,6 j sur la duree par defaut).
+TRENDING_DURATIONS = ("5m", "1h", "6h", "24h")
+
+# Le tri par defaut de l'API favorise les pools fraiches. Le volume favorise
+# les pools etablies, donc plus agees.
+VOLUME_SORT = "h24_volume_usd_desc"
+
+# DEX souhaites. Les identifiants NE SONT PAS codes en dur : ils sont
+# resolus contre /networks/solana/dexes au demarrage, et un nom absent de la
+# reponse est ignore avec un log.
+PREFERRED_DEXES = ("raydium", "meteora", "pumpswap", "orca")
 
 # Quote assets et LST : ils apparaissent en base_token sur certains pools
 # mais ne sont jamais des winners recherches.
@@ -145,28 +164,88 @@ def _index_tokens(included: Iterable[dict], index: dict[str, dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
+SourceSpec = tuple[str, Callable[[int], "gt.PoolPage | None"], int]
+
+
+def resolve_dexes() -> list[str]:
+    """Identifiants de DEX reellement exposes par l'API, parmi les souhaites.
+
+    Un seul appel. On ne code aucun identifiant en dur : chaque valeur
+    retournee vient de /networks/solana/dexes. Un DEX souhaite mais absent
+    de la reponse est ignore, pas devine.
+    """
+    data = gt.dexes()
+    if data is None:
+        log.warning(
+            "PERTE : /networks/%s/dexes indisponible, collecte par DEX "
+            "desactivee pour ce run", "solana",
+        )
+        return []
+
+    available = [d.get("id") for d in data if isinstance(d.get("id"), str)]
+    log.info("DEX disponibles (%d) : %s", len(available), ", ".join(available))
+
+    resolved: list[str] = []
+    for wanted in PREFERRED_DEXES:
+        if wanted in available:
+            resolved.append(wanted)
+            continue
+        # Variantes du type 'raydium-clmm' quand l'id simple n'existe pas.
+        variant = next((d for d in available if d.startswith(f"{wanted}-")), None)
+        if variant:
+            log.info("DEX '%s' absent, variante retenue : '%s'", wanted, variant)
+            resolved.append(variant)
+        else:
+            log.warning("DEX '%s' absent de la reponse, ignore", wanted)
+
+    log.info("DEX retenus (%d) : %s", len(resolved), ", ".join(resolved) or "aucun")
+    return resolved
+
+
+def build_source_specs(dex_ids: list[str]) -> list[SourceSpec]:
+    """(libelle, fonction de page, nombre de pages) par source de collecte."""
+    specs: list[SourceSpec] = [
+        (f"trending_{duration}",
+         partial(gt.trending_pools, duration=duration),
+         TRENDING_POOLS_PAGES)
+        for duration in TRENDING_DURATIONS
+    ]
+    specs.append(
+        ("pools_volume", partial(gt.top_pools, sort=VOLUME_SORT), TOP_POOLS_PAGES)
+    )
+    specs.extend(
+        (f"dex_{dex}", partial(gt.dex_pools, dex, sort=VOLUME_SORT), DEX_POOLS_PAGES)
+        for dex in dex_ids
+    )
+    return specs
+
+
 def collect_pools() -> tuple[list[dict], dict[str, dict], int]:
-    """Agrege new_pools, trending_pools et pools.
+    """Agrege toutes les sources de collecte.
 
     Retourne (pools, index mint -> attributs token, nombre de pages perdues).
+    Une source qui echoue est loguee et n'interrompt pas les autres.
     """
-    sources = (
-        ("new_pools", gt.new_pools, NEW_POOLS_PAGES),
-        ("trending_pools", gt.trending_pools, TRENDING_POOLS_PAGES),
-        ("pools", gt.top_pools, TOP_POOLS_PAGES),
+    specs = build_source_specs(resolve_dexes())
+    planned = sum(min(pages, gt.MAX_PAGE) for _, _, pages in specs)
+    log.info(
+        "Collecte : %d sources, %d appels au plus (~%.0f s de throttle)",
+        len(specs), planned, planned * MIN_REQUEST_INTERVAL_S,
     )
+
     pools: list[dict] = []
     token_index: dict[str, dict] = {}
     losses = 0
-
     now = datetime.now(timezone.utc)
-    for label, fetch, pages in sources:
+
+    for label, fetch, pages in specs:
         collected = 0
+        source_losses = 0
         ages: list[float] = []
-        for page in range(1, pages + 1):
+        for page in range(1, min(pages, gt.MAX_PAGE) + 1):
             result = fetch(page)
             if result is None:  # perte deja loguee cote client HTTP
-                losses += 1
+                source_losses += 1
                 continue
             batch, included = result
             if not batch:  # vraie fin de pagination
@@ -180,9 +259,12 @@ def collect_pools() -> tuple[list[dict], dict[str, dict], int]:
                 )
                 if created is not None:
                     ages.append(_pool_age_days(created, now))
+        losses += source_losses
         # L'age median dit si la source vise la meme fenetre que nos seuils.
         median = f"{statistics.median(ages):.1f}".replace(".", ",") if ages else "n/a"
         log.info("%-16s : %d pools, age median %s j", label, collected, median)
+        if source_losses and not collected:
+            log.warning("PERTE : source %s sans aucun resultat exploitable", label)
 
     if losses:
         log.warning("Collecte : %d page(s) perdue(s), couverture incomplete", losses)

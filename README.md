@@ -17,6 +17,7 @@ serviront ensuite a identifier les wallets.
 | `main.py` | Point d'entree, dispatch via `RUN_MODE` |
 | `find_winners.py` | Pipeline de discovery |
 | `probe_sort.py` | Sonde jetable : le tri de `/pools` est-il applique ? |
+| `probe_helius.py` | Sonde jetable : forme des reponses Helius (phase 2) |
 
 ## Installation
 
@@ -33,6 +34,7 @@ Aucun secret n'est versionne. Trois variables sont lues via `os.environ` :
 | --- | --- |
 | `RUN_MODE` | `winners` (defaut) ou `probe` — voir Execution |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
+| `HELIUS_API_KEY` | Cle Helius — requise par `RUN_MODE=probe_helius` uniquement |
 | `SUPABASE_URL` | URL du projet Supabase |
 | `SUPABASE_KEY` | Cle Supabase avec droit d'ecriture sur `sol_analyzed_tokens` |
 
@@ -47,13 +49,15 @@ Point d'entree unique : `main.py`, qui lit `RUN_MODE`.
 
 ```bash
 RUN_MODE=winners python main.py   # defaut : pipeline de discovery
-RUN_MODE=probe   python main.py   # sonde de tri uniquement
+RUN_MODE=probe   python main.py   # sonde de tri (CoinGecko)
+RUN_MODE=probe_helius python main.py   # sonde Helius (phase 2)
 ```
 
 | `RUN_MODE` | Effet |
 | --- | --- |
 | `winners` (defaut, valeur vide incluse) | pipeline de discovery |
-| `probe` | sonde de tri, le pipeline n'est pas lance |
+| `probe` | sonde de tri CoinGecko, le pipeline n'est pas lance |
+| `probe_helius` | sonde Helius, le pipeline n'est pas lance |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -164,6 +168,37 @@ sert de preuve plus forte que la seule premiere adresse.
 
 Elle remplace l'ancienne sonde megafilter : cet endpoint est reserve aux
 plans payants et n'est pas exploitable sur la cle Demo.
+
+## La sonde `RUN_MODE=probe_helius`
+
+Premiere brique de la **phase 2** : retrouver les premiers acheteurs des
+winners de la phase 1. `probe_helius.py` ne fait que sonder — aucune
+ecriture en base, aucun parsing, aucune notion d'acheteur ni de rang. Le but
+est de connaitre la forme reelle des reponses avant d'ecrire le parsing.
+
+Deux mints winners reels, un de chaque famille (CATE sur pump.fun, STONK
+hors pump), et deux voies d'acces par mint :
+
+| Voie | Appel |
+| --- | --- |
+| A | `getTransactionsForAddress` sur l'endpoint JSON-RPC |
+| B | API Enhanced Transactions REST, en repli |
+
+Pour chaque appel : code HTTP, message d'erreur **brut** de Helius, nombre
+de transactions, horodatage de la premiere et de la derniere du lot (pour
+verifier l'ordre chronologique), et la structure complete de la premiere
+transaction en JSON indente, tronquee a 4000 caracteres. Puis les champs
+reperes dans cette transaction : signataire, transferts (avec les noms de
+champs qui portent source, destination et montant), programme et type.
+
+Les messages d'erreur sont affiches tels quels avec le corps de requete
+envoye : ce sont eux qui donneront le bon nom de methode ou de parametre si
+la voie A n'existe pas sous ce nom.
+
+`HELIUS_API_KEY` absente dans ce mode : la sonde **leve**, elle ne continue
+pas. La cle n'apparait jamais dans les logs, les URL sont masquees. Le
+throttle Helius (0,5 s) est **dedie** et independant de celui de CoinGecko :
+free tier a 10 req/s, la sonde n'en fait que 4.
 
 La deduplication par mint devient critique ici : les 9 sources se recoupent
 largement. Le pool le plus liquide de chaque token est conserve, les autres

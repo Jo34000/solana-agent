@@ -33,42 +33,37 @@ from config import (
 
 log = logging.getLogger("solana-agent")
 
-# Objectif de volume : en dessous, le recoupement entre early buyers ne
-# donne rien (constate sur ETH avec 7 winners).
-WINNERS_TARGET = 50
-
-# Topologie de collecte, recalibree a chaque run sur l'age median mesure par
-# source. Sont sorties de la collecte les sources structurellement hors
-# fenetre 7-60 j :
-#   new_pools     0,0 j   (17/09) - reviendra pour une logique d'accumulation
-#   pools_volume  0,4 j   (17/09) - le tri par volume n'a rien change
-#   dex_pumpswap  0,3 j   (17/09)
-#   dex_orca    404,1 j   (17/09)
-TRENDING_POOLS_PAGES = 5
+# Topologie de collecte, arretee au run du 17/09 19:18 apres trois
+# iterations de mesure. Seules subsistent les sources dont l'age median tombe
+# dans la fenetre 7-60 j ou s'en approche.
+#
+# Sorties de la collecte, avec leur age median mesure :
+#   new_pools             0,0 j - reviendra pour une logique d'accumulation
+#   trending_5m           0,1 j
+#   dex_meteora-damm-v2   0,3 j
+#   dex_meteora-dbc       0,3 j
+#   dex_pumpswap          0,3 j
+#   pools_volume          0,4 j - le tri par volume n'y a rien change
+#   dex_bags-fm           3,2 j
+#   dex_orca            404,1 j
+#   dex_boop-fun        504,0 j - 17 pools seulement
+#   dex_heaven              n/a - 0 pool
+TRENDING_POOLS_PAGES = 10
 DEX_POOLS_PAGES = 10
 
-# Les quatre durees sont interrogees separement. 6h (39,5 j) et 24h (28,6 j)
-# portent la collecte ; 5m (1,6 j) et 1h (87,8 j) sont marginaux mais non
-# nuls, donc conserves le temps de trancher.
-TRENDING_DURATIONS = ("5m", "1h", "6h", "24h")
+# Trois durees conservees : 1h (49,9 j), 6h (21,0 j), 24h (21,0 j).
+TRENDING_DURATIONS = ("1h", "6h", "24h")
 
 VOLUME_SORT = "h24_volume_usd_desc"
 
-# DEX souhaites, tous en forme EXACTE : ces identifiants sont tires de la
-# liste reelle renvoyee par /networks/solana/dexes au run precedent. Ils sont
-# malgre tout re-resolus a chaque run, et un id absent de la reponse est
-# ignore avec un warning plutot que devine.
-#   raydium 5,9 j et meteora 43,3 j sont mesures ; les six autres sont a
-#   mesurer, aucune hypothese sur leur productivite.
+# DEX conserves, tous en forme EXACTE tiree de la liste reelle renvoyee par
+# /networks/solana/dexes. Ils sont malgre tout re-resolus a chaque run, et un
+# id absent de la reponse est ignore avec un warning plutot que devine.
+# Ages medians : meteora 41,7 j, raydium-clmm 15,9 j, raydium 5,3 j.
 PREFERRED_DEXES = (
-    "raydium",
     "meteora",
     "raydium-clmm",
-    "meteora-damm-v2",
-    "meteora-dbc",
-    "bags-fm",
-    "heaven",
-    "boop-fun",
+    "raydium",
 )
 
 # Quote assets et LST : ils apparaissent en base_token sur certains pools
@@ -533,12 +528,9 @@ def run() -> int:
             f"{winner['liquidity_usd']:,.0f}",
         )
 
-    if len(winners) < WINNERS_TARGET:
-        log.warning(
-            "Objectif non atteint : %d winners sur %d vises. Relancer le run "
-            "ou assouplir les seuils AJUSTABLES de config.py.",
-            len(winners), WINNERS_TARGET,
-        )
+    # La base s'alimente par accumulation hebdomadaire via le TTL : le
+    # compte d'un run isole n'est pas un objectif a atteindre.
+    log.info("winners ce run : %d", len(winners))
     return len(winners)
 
 

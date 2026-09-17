@@ -63,11 +63,11 @@ RUN_MODE=probe   python main.py   # sonde de tri uniquement
 
 ## Pipeline
 
-1. **Collecte** — 12 sources, 101 appels (~3,5 min de throttle) :
-   `trending_pools` sur les 4 durees (5m, 1h, 6h, 24h), p. 1-5 chacune ;
-   puis les pools de chaque DEX retenu en `sort=h24_volume_usd_desc`,
-   p. 1-10. Jamais de page > 10 : la pagination au dela est reservee aux
-   plans payants et le client refuse l'appel.
+1. **Collecte** — 6 sources, 61 appels (~2,1 min de throttle) :
+   `trending_pools` sur 3 durees (1h, 6h, 24h), p. 1-10 chacune ; puis les
+   pools de 3 DEX en `sort=h24_volume_usd_desc`, p. 1-10. Jamais de
+   page > 10 : la pagination au dela est reservee aux plans payants et le
+   client refuse l'appel.
 2. **Deduplication par mint**, pas par pool : un token a souvent plusieurs
    pools, on garde le plus liquide.
 3. **Exclusion du bruit** : SOL, wSOL, USDC, USDT et les LST (JitoSOL, mSOL,
@@ -113,34 +113,37 @@ calculee des qu'elle est calculable, y compris quand `perf_x` ne l'est pas.
 
 ## Pourquoi cette topologie de collecte
 
-La collecte se recalibre a chaque run sur l'**age median mesure par
+La collecte a ete calibree en trois iterations sur l'**age median mesure par
 source** : une source dont la mediane est structurellement hors de la
-fenetre 7-60 j est retiree, pas ajustee.
+fenetre 7-60 j est retiree, pas ajustee. Etat arrete au run du 17/09 19:18.
 
-Mesures du run du 17/09 (1400 pools) :
+**Sources conservees**, 10 pages chacune :
 
-| Source | Age median | Decision |
+| Source | Age median |
+| --- | --- |
+| `trending_1h` | 49,9 j |
+| `dex_meteora` | 41,7 j |
+| `trending_6h` | 21,0 j |
+| `trending_24h` | 21,0 j |
+| `dex_raydium-clmm` | 15,9 j |
+| `dex_raydium` | 5,3 j |
+
+**Sources retirees**, avec l'age median qui les a disqualifiees :
+
+| Source | Age median | |
 | --- | --- | --- |
-| `dex_orca` | 404,1 j | retiree |
-| `trending_1h` | 87,8 j | conservee, marginale |
-| `dex_meteora` | 43,3 j | conservee |
-| `trending_6h` | 39,5 j | conservee |
-| `trending_24h` | 28,6 j | conservee |
-| `dex_raydium` | 5,9 j | conservee |
-| `trending_5m` | 1,6 j | conservee, marginale |
-| `pools_volume` | 0,4 j | retiree |
-| `dex_pumpswap` | 0,3 j | retiree |
-| `new_pools` (run precedent) | 0,0 j | retiree |
+| `dex_boop-fun` | 504,0 j | 17 pools seulement |
+| `dex_orca` | 404,1 j | |
+| `dex_bags-fm` | 3,2 j | |
+| `pools_volume` | 0,4 j | le tri par volume n'y a rien change |
+| `dex_meteora-damm-v2` | 0,3 j | |
+| `dex_meteora-dbc` | 0,3 j | |
+| `dex_pumpswap` | 0,3 j | |
+| `trending_5m` | 0,1 j | |
+| `new_pools` | 0,0 j | reviendra pour une logique d'accumulation |
 
-Retirer `pools_volume`, `dex_pumpswap` et `dex_orca` libere 30 appels,
-reinvestis dans six DEX supplementaires a mesurer : `raydium-clmm`,
-`meteora-damm-v2`, `meteora-dbc`, `bags-fm`, `heaven`, `boop-fun`. Aucune
-hypothese sur leur productivite — c'est leur age median au prochain run qui
-tranchera.
-
-`pools_volume` a rendu le meme age median (0,4 j) avec et sans
-`sort=h24_volume_usd_desc`, d'ou le soupcon que le parametre de tri est
-ignore. C'est ce que mesure `RUN_MODE=probe` (voir plus bas).
+Le budget passe de 101 a 61 appels, et les trois sources `trending_*`
+doublent de 5 a 10 pages avec les appels liberes.
 
 Les identifiants de DEX **ne sont pas codes en dur** : `resolve_dexes()`
 appelle `/networks/solana/dexes` au demarrage et ne retient que les ids
@@ -201,7 +204,7 @@ ecrit `NULL`, jamais `0`, pour ne pas fausser la calibration.
 
 - **Rate limit** : 2,1 s minimum entre deux appels. La cle Demo est plafonnee
   a 30 req/min et **partagee** avec l'agent ETH. Ne pas reduire l'intervalle :
-  la collecte coute 101 appels, plus un appel OHLCV par candidat retenu.
+  la collecte coute 61 appels, plus un appel OHLCV par candidat retenu.
 - **Pertes explicites** : tout appel abandonne apres retries logue
   `PERTE : <endpoint> abandonne apres N tentatives` et retourne `None`. Jamais
   de liste vide silencieuse.
@@ -212,9 +215,11 @@ ecrit `NULL`, jamais `0`, pour ne pas fausser la calibration.
 - **Aucun etat sur le filesystem** : Railway est ephemere, tout ce qui doit
   survivre va en base.
 
-## Objectif de volume
+## Volume de winners
 
-Cible : **50 winners ou plus**. Sur Ethereum, 7 winners avaient donne zero
-recoupement entre early buyers, ce qui bloquait toute la suite. Si le run
-termine sous la cible, il logue un avertissement : relancer, ou assouplir les
-seuils AJUSTABLES de `config.py`.
+La base **s'alimente par accumulation** : chaque run n'analyse que les mints
+absents de `sol_analyzed_tokens` depuis moins de `ANALYZED_TTL_DAYS`, si bien
+que des runs hebdomadaires empilent des winners nouveaux au lieu de
+re-mesurer les memes. Le compte d'un run isole n'est donc pas un objectif a
+atteindre : le run logue `winners ce run : N` a titre informatif, sans
+avertissement.

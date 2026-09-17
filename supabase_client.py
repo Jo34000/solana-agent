@@ -14,7 +14,8 @@ Colonnes attendues cote Supabase :
     fdv_usd         numeric      (NULL si absent du payload, jamais 0)
     liquidity_usd   numeric
     volume_24h_usd  numeric
-    perf_x          numeric
+    perf_x          numeric      (entree fin du 1er jour -> pic ulterieur)
+    perf_x_launch   numeric      (open de lancement -> pic, pour comparaison)
     peak_at         timestamptz
     is_winner       boolean
     rejected_reason text

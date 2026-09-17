@@ -14,7 +14,8 @@ serviront ensuite a identifier les wallets.
 | `config.py` | Seuils AJUSTABLES + diagnostic des variables d'environnement |
 | `geckoterminal.py` | Client HTTP CoinGecko onchain (rate limit, retry, pertes explicites) |
 | `supabase_client.py` | Lecture / upsert sur `sol_analyzed_tokens` |
-| `find_winners.py` | Pipeline de discovery (point d'entree) |
+| `main.py` | Point d'entree, dispatch via `RUN_MODE` |
+| `find_winners.py` | Pipeline de discovery |
 | `probe_megafilter.py` | Sonde jetable sur `/pools/megafilter`, independante du pipeline |
 
 ## Installation
@@ -30,6 +31,7 @@ Aucun secret n'est versionne. Trois variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
+| `RUN_MODE` | `winners` (defaut) ou `probe` — voir Execution |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `SUPABASE_URL` | URL du projet Supabase |
 | `SUPABASE_KEY` | Cle Supabase avec droit d'ecriture sur `sol_analyzed_tokens` |
@@ -41,10 +43,23 @@ bascule silencieuse en mode degrade.
 
 ## Execution
 
+Point d'entree unique : `main.py`, qui lit `RUN_MODE`.
+
 ```bash
-python find_winners.py      # pipeline de discovery
-python probe_megafilter.py  # sonde exploratoire, un seul appel API
+RUN_MODE=winners python main.py   # defaut : pipeline de discovery
+RUN_MODE=probe   python main.py   # sonde megafilter uniquement
 ```
+
+| `RUN_MODE` | Effet |
+| --- | --- |
+| `winners` (defaut, valeur vide incluse) | pipeline de discovery |
+| `probe` | sonde megafilter, le pipeline n'est pas lance |
+| autre valeur | erreur explicite au demarrage, pas de repli silencieux |
+
+> **Railway** : la Start Command doit etre `python main.py`. Lancer
+> `python find_winners.py` fonctionne toujours mais execute *toujours* le
+> pipeline winners — un `RUN_MODE=probe` y serait sans effet, et le script
+> le signale par un warning au lieu de tourner silencieusement.
 
 ## Pipeline
 
@@ -59,21 +74,61 @@ python probe_megafilter.py  # sonde exploratoire, un seul appel API
    sur le drawdown : sur Solana un vrai winner fait -85% en routine.
 5. **Memoire** : les mints analyses depuis moins de `ANALYZED_TTL_DAYS` sont
    ecartes, sinon chaque run reanalyse les memes tokens.
-6. **OHLCV journalier 60 j** par candidat :
-   `perf_x = max(high) / premier open non nul`, `peak_at` = date du max.
-   OHLCV vide, open a zero ou moins de 3 bougies -> `rejected_reason =
-   "ohlcv_invalide"`, sans crash.
+6. **OHLCV journalier 60 j** par candidat, deux metriques (voir plus bas).
+   Moins de 3 bougies -> `ohlcv_insuffisant` ; `close` du 1er jour a zero ->
+   `ohlcv_invalide`. Sans crash dans les deux cas.
 7. **Upsert de tous les candidats analyses**, winners comme non-winners : ce
    sont les seconds qui alimentent la memoire.
 
 Un OHLCV **perdu** (echec reseau apres retries) n'est pas ecrit en base : le
 token sera retente au prochain run plutot qu'enterre dans la memoire.
 
+Les tokens **ecartes en pre-filtre** (etapes 2 a 4) ne sont pas ecrits non
+plus, et c'est volontaire : un token rejete aujourd'hui parce que son pool a
+moins de `MIN_POOL_AGE_DAYS` sera eligible dans quelques jours. L'ecrire avec
+un TTL de 60 jours l'enterrerait. Seuls les candidats reellement **analyses**
+(OHLCV recupere) alimentent la memoire.
+
+## Les deux mesures de performance
+
+```
+perf_x_launch = max(high) / premier open non nul
+perf_x        = max(high des bougies d'index >= 1) / close de la bougie d'index 0
+```
+
+`perf_x_launch` est la mesure historique. Pour un token lance sur bonding
+curve, le premier open est le prix de depart de la courbe, proche de zero :
+la valeur est mecaniquement enorme et ne discrimine rien.
+
+`perf_x` mesure ce qu'un acheteur entre a la fin du premier jour aurait pu
+faire. **C'est elle qui determine `is_winner`**, et `peak_at` suit son pic.
+
+Les deux sont ecrites en base pour permettre de comparer leur distribution
+sur donnees reelles avant de fixer `WINNER_MULTIPLE`. `perf_x_launch` est
+calculee des qu'elle est calculable, y compris quand `perf_x` ne l'est pas.
+
+## Lire l'entonnoir de collecte
+
+Chaque run logue une ligne par source avec l'age median des pools retournes,
+puis une ligne de synthese du filtrage :
+
+```
+new_pools        : 200 pools, age median 0,8 j
+filtrage : doublon_pool 120 | bruit 8 | age_trop_jeune 210 | age_trop_vieux 0 | ...
+```
+
+Les motifs sont mutuellement exclusifs et verifient l'invariant
+`collectes = somme(motifs hors deja_analyse) + dedupliques`. Ventiler
+`age_trop_jeune` et `age_trop_vieux` separement est le point cle : c'est ce
+qui dit si la fenetre d'age est mal placee ou si les endpoints collectent a
+cote de la cible.
+
 ## Table `sol_analyzed_tokens`
 
 Colonnes attendues : `mint` (unique), `symbol`, `name`, `pool_address`,
 `dex`, `pool_created_at`, `fdv_usd`, `liquidity_usd`, `volume_24h_usd`,
-`perf_x`, `peak_at`, `is_winner`, `rejected_reason`, `analyzed_at`.
+`perf_x`, `perf_x_launch`, `peak_at`, `is_winner`, `rejected_reason`,
+`analyzed_at`.
 
 `dex`, `pool_created_at` et `fdv_usd` viennent du payload des endpoints de
 liste (aucun appel supplementaire) et sont ecrites pour **tous** les

@@ -11,6 +11,8 @@ les wallets qui les ont achetes tot.
 from __future__ import annotations
 
 import logging
+import os
+import statistics
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
@@ -157,8 +159,10 @@ def collect_pools() -> tuple[list[dict], dict[str, dict], int]:
     token_index: dict[str, dict] = {}
     losses = 0
 
+    now = datetime.now(timezone.utc)
     for label, fetch, pages in sources:
         collected = 0
+        ages: list[float] = []
         for page in range(1, pages + 1):
             result = fetch(page)
             if result is None:  # perte deja loguee cote client HTTP
@@ -170,7 +174,15 @@ def collect_pools() -> tuple[list[dict], dict[str, dict], int]:
             pools.extend(batch)
             _index_tokens(included, token_index)
             collected += len(batch)
-        log.info("Collecte %-16s : %d pools", label, collected)
+            for pool in batch:
+                created = _parse_created_at(
+                    pool.get("attributes", {}).get("pool_created_at")
+                )
+                if created is not None:
+                    ages.append(_pool_age_days(created, now))
+        # L'age median dit si la source vise la meme fenetre que nos seuils.
+        median = f"{statistics.median(ages):.1f}".replace(".", ",") if ages else "n/a"
+        log.info("%-16s : %d pools, age median %s j", label, collected, median)
 
     if losses:
         log.warning("Collecte : %d page(s) perdue(s), couverture incomplete", losses)
@@ -182,35 +194,79 @@ def collect_pools() -> tuple[list[dict], dict[str, dict], int]:
 # ---------------------------------------------------------------------------
 
 
-def build_candidates(pools: list[dict], token_index: dict[str, dict]) -> list[dict]:
-    """Un candidat par token (le pool le plus liquide), pre-filtres appliques."""
+# Motifs de rejet du pre-filtre, dans l'ordre d'affichage. Ils sont mutuellement
+# exclusifs : collectes = somme(motifs hors deja_analyse) + dedupliques.
+FUNNEL_REASONS = (
+    "doublon_pool",
+    "bruit",
+    "age_trop_jeune",
+    "age_trop_vieux",
+    "liquidite_insuffisante",
+    "volume_insuffisant",
+    "payload_incomplet",
+    "deja_analyse",
+)
+
+
+def new_funnel() -> dict[str, int]:
+    return {reason: 0 for reason in FUNNEL_REASONS}
+
+
+def format_funnel(funnel: dict[str, int]) -> str:
+    return " | ".join(f"{reason} {funnel[reason]}" for reason in FUNNEL_REASONS)
+
+
+def build_candidates(
+    pools: list[dict], token_index: dict[str, dict]
+) -> tuple[list[dict], dict[str, int]]:
+    """Un candidat par token (le pool le plus liquide), pre-filtres appliques.
+
+    Retourne (candidats, compteurs de rejet par motif). Les compteurs sont la
+    seule facon de savoir quel filtre elimine quoi : sans eux, tout reglage de
+    seuil serait de l'intuition.
+    """
     now = datetime.now(timezone.utc)
     best: dict[str, dict] = {}
+    funnel = new_funnel()
 
     for pool in pools:
         mint = _base_mint(pool)
-        if not mint or mint in NOISE_MINTS:
+        if not mint:
+            funnel["payload_incomplet"] += 1
+            continue
+        if mint in NOISE_MINTS:
+            funnel["bruit"] += 1
             continue
 
         attrs = pool.get("attributes", {})
         token_attrs = token_index.get(mint, {})
         symbol = (token_attrs.get("symbol") or _symbol_from_pool_name(pool)).strip()
         if symbol.upper() in NOISE_SYMBOLS:
+            funnel["bruit"] += 1
             continue
 
         created = _parse_created_at(attrs.get("pool_created_at"))
         if created is None:
+            funnel["payload_incomplet"] += 1
             continue
         age = _pool_age_days(created, now)
-        if not (MIN_POOL_AGE_DAYS <= age <= MAX_POOL_AGE_DAYS):
+        # Ventiler jeune/vieux separement : c'est ce qui dira si la fenetre
+        # d'age est mal placee ou si les endpoints collectent a cote.
+        if age < MIN_POOL_AGE_DAYS:
+            funnel["age_trop_jeune"] += 1
+            continue
+        if age > MAX_POOL_AGE_DAYS:
+            funnel["age_trop_vieux"] += 1
             continue
 
         liquidity = _to_float(attrs.get("reserve_in_usd"))
         if liquidity < MIN_LIQUIDITY_USD:
+            funnel["liquidite_insuffisante"] += 1
             continue
 
         volume_24h = _to_float((attrs.get("volume_usd") or {}).get("h24"))
         if volume_24h < MIN_VOLUME_24H_USD:
+            funnel["volume_insuffisant"] += 1
             continue
 
         pool_address = attrs.get("address") or (pool.get("id", "").split("_", 1)[-1])
@@ -228,10 +284,12 @@ def build_candidates(pools: list[dict], token_index: dict[str, dict]) -> list[di
         # Un token a souvent plusieurs pools : on garde le plus liquide, qui
         # porte l'historique de prix le plus representatif.
         previous = best.get(mint)
+        if previous is not None:
+            funnel["doublon_pool"] += 1  # un pool du mint est ecarte, pas le token
         if previous is None or liquidity > previous["liquidity_usd"]:
             best[mint] = candidate
 
-    return list(best.values())
+    return list(best.values()), funnel
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +298,19 @@ def build_candidates(pools: list[dict], token_index: dict[str, dict]) -> list[di
 
 
 def analyze_performance(candidate: dict) -> dict | None:
-    """Enrichit le candidat avec perf_x / peak_at / is_winner.
+    """Enrichit le candidat avec perf_x, perf_x_launch, peak_at, is_winner.
+
+    Deux metriques, ecrites cote a cote pour pouvoir comparer leur
+    distribution sur donnees reelles :
+
+      perf_x_launch = max(high) / premier open non nul
+          Mesure historique. Pour un token lance sur bonding curve, le premier
+          open est le prix de depart de la courbe, proche de zero : la valeur
+          est mecaniquement enorme et ne discrimine rien.
+
+      perf_x = max(high des bougies d'index >= 1) / close de la bougie d'index 0
+          Ce qu'un acheteur entre a la fin du premier jour aurait pu faire.
+          C'est elle qui determine is_winner.
 
     Retourne None si l'OHLCV a ete PERDU (reseau) : dans ce cas on n'ecrit
     rien, pour que le token soit retente au prochain run au lieu d'etre
@@ -251,28 +321,36 @@ def analyze_performance(candidate: dict) -> dict | None:
         return None
 
     row = dict(candidate)
+    row.update(perf_x=None, perf_x_launch=None, peak_at=None, is_winner=False)
+
     # [timestamp, open, high, low, close, volume], ordre decroissant cote API.
     ordered = sorted(
         (c for c in candles if isinstance(c, (list, tuple)) and len(c) >= 5),
         key=lambda c: _to_float(c[0]),
     )
     if len(ordered) < 3:
-        row.update(perf_x=None, peak_at=None, is_winner=False,
-                   rejected_reason="ohlcv_invalide")
+        row["rejected_reason"] = "ohlcv_insuffisant"
         return row
 
+    # Metrique historique, calculee des qu'elle est calculable : elle sert de
+    # point de comparaison meme quand perf_x ne l'est pas.
     first_open = next((_to_float(c[1]) for c in ordered if _to_float(c[1]) > 0), 0.0)
-    highs = [(_to_float(c[2]), _to_float(c[0])) for c in ordered]
+    peak_all = max(_to_float(c[2]) for c in ordered)
+    if first_open > 0 and peak_all > 0:
+        row["perf_x_launch"] = round(peak_all / first_open, 4)
+
+    entry = _to_float(ordered[0][4])  # close du premier jour
+    highs = [(_to_float(c[2]), _to_float(c[0])) for c in ordered[1:]]
     peak_price, peak_ts = max(highs, key=lambda item: item[0])
-    if first_open <= 0 or peak_price <= 0:
-        row.update(perf_x=None, peak_at=None, is_winner=False,
-                   rejected_reason="ohlcv_invalide")
+    if entry <= 0 or peak_price <= 0:
+        row["rejected_reason"] = "ohlcv_invalide"
         return row
 
-    perf_x = peak_price / first_open
+    perf_x = peak_price / entry
     is_winner = perf_x >= WINNER_MULTIPLE
     row.update(
         perf_x=round(perf_x, 4),
+        # peak_at suit la metrique qui decide is_winner.
         peak_at=datetime.fromtimestamp(peak_ts, tz=timezone.utc).isoformat(),
         is_winner=is_winner,
         # Pas de filtre sur le drawdown : sur Solana un vrai winner fait
@@ -292,16 +370,20 @@ def run() -> int:
     diagnose_environment()
 
     pools, token_index, _ = collect_pools()
-    candidates = build_candidates(pools, token_index)
+    candidates, funnel = build_candidates(pools, token_index)
 
     known = db.fetch_recent_mints(ANALYZED_TTL_DAYS)
     fresh = [c for c in candidates if c["mint"] not in known]
-    already = len(candidates) - len(fresh)
+    funnel["deja_analyse"] = len(candidates) - len(fresh)
 
     log.info(
         "collectes %d | dedupliques %d | deja analyses %d | a analyser %d",
-        len(pools), len(candidates), already, len(fresh),
+        len(pools), len(candidates), funnel["deja_analyse"], len(fresh),
     )
+    log.info("filtrage : %s", format_funnel(funnel))
+    # Les tokens rejetes en pre-filtre ne sont PAS ecrits en base : un token
+    # ecarte aujourd'hui pour age < MIN_POOL_AGE_DAYS sera eligible dans
+    # quelques jours, l'ecrire avec un TTL de 60 j l'enterrerait.
     if not fresh:
         log.info("Rien de nouveau a analyser.")
         return 0
@@ -339,7 +421,10 @@ def run() -> int:
         key=lambda r: r["perf_x"],
         reverse=True,
     )
-    invalid = sum(1 for r in analyzed if r["rejected_reason"] == "ohlcv_invalide")
+    invalid = sum(
+        1 for r in analyzed
+        if r["rejected_reason"] in ("ohlcv_invalide", "ohlcv_insuffisant")
+    )
     calls, losses = gt.request_stats()
 
     log.info("=== Resume ===")
@@ -349,10 +434,12 @@ def run() -> int:
         len(analyzed), len(winners), invalid, calls, losses,
     )
     for winner in winners:
+        launch = winner["perf_x_launch"]
         log.info(
-            "  WINNER %-12s x%-7s %s  liq %s$",
+            "  WINNER %-12s x%-8s (launch %s)  %s  liq %s$",
             winner["symbol"][:12],
-            round(winner["perf_x"], 2),
+            round(winner["perf_x"], 1),
+            f"x{launch:.1f}" if launch is not None else "n/a",
             winner["mint"],
             f"{winner['liquidity_usd']:,.0f}",
         )
@@ -367,4 +454,14 @@ def run() -> int:
 
 
 if __name__ == "__main__":
+    # Point d'entree direct. RUN_MODE est gere par main.py : si quelqu'un le
+    # positionne en pensant changer de mode ici, on le dit plutot que de
+    # lancer silencieusement le mauvais traitement.
+    _mode = os.environ.get("RUN_MODE", "").strip().lower()
+    if _mode and _mode != "winners":
+        setup_logging()
+        log.warning(
+            "RUN_MODE=%s ignore : ce script ne lance que le pipeline winners. "
+            "Utiliser 'python main.py' comme Start Command.", _mode,
+        )
     run()

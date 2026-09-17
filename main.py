@@ -4,7 +4,7 @@ Railway n'expose qu'une seule Start Command : le mode est donc choisi par la
 variable d'environnement RUN_MODE.
 
     RUN_MODE=winners  (defaut) -> pipeline de discovery (find_winners.run)
-    RUN_MODE=probe             -> sonde megafilter uniquement
+    RUN_MODE=probe             -> sonde de tri uniquement
 
 Start Command Railway : python main.py
 """
@@ -39,9 +39,9 @@ def main() -> int:
     log.info("RUN_MODE=%s", mode)
 
     if mode == "probe":
-        import probe_megafilter
+        import probe_sort
 
-        probe_megafilter.main()
+        probe_sort.main()
         return 0
 
     import find_winners

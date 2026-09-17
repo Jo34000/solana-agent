@@ -37,26 +37,39 @@ log = logging.getLogger("solana-agent")
 # donne rien (constate sur ETH avec 7 winners).
 WINNERS_TARGET = 50
 
-# Topologie de collecte, calibree sur le run du 17/09 : new_pools (age median
-# 0,0 j) et le tri par defaut de /pools (h24_tx_count_desc, 0,4 j) ne
-# produisaient que des pools trop jeunes pour la fenetre. 403 des 500 pools
-# collectes etaient rejetes en age_trop_jeune.
+# Topologie de collecte, recalibree a chaque run sur l'age median mesure par
+# source. Sont sorties de la collecte les sources structurellement hors
+# fenetre 7-60 j :
+#   new_pools     0,0 j   (17/09) - reviendra pour une logique d'accumulation
+#   pools_volume  0,4 j   (17/09) - le tri par volume n'a rien change
+#   dex_pumpswap  0,3 j   (17/09)
+#   dex_orca    404,1 j   (17/09)
 TRENDING_POOLS_PAGES = 5
-TOP_POOLS_PAGES = 10
 DEX_POOLS_PAGES = 10
 
-# Les quatre durees sont interrogees separement : c'est la seule source qui
-# tombait dans la fenetre (age median 28,6 j sur la duree par defaut).
+# Les quatre durees sont interrogees separement. 6h (39,5 j) et 24h (28,6 j)
+# portent la collecte ; 5m (1,6 j) et 1h (87,8 j) sont marginaux mais non
+# nuls, donc conserves le temps de trancher.
 TRENDING_DURATIONS = ("5m", "1h", "6h", "24h")
 
-# Le tri par defaut de l'API favorise les pools fraiches. Le volume favorise
-# les pools etablies, donc plus agees.
 VOLUME_SORT = "h24_volume_usd_desc"
 
-# DEX souhaites. Les identifiants NE SONT PAS codes en dur : ils sont
-# resolus contre /networks/solana/dexes au demarrage, et un nom absent de la
-# reponse est ignore avec un log.
-PREFERRED_DEXES = ("raydium", "meteora", "pumpswap", "orca")
+# DEX souhaites, tous en forme EXACTE : ces identifiants sont tires de la
+# liste reelle renvoyee par /networks/solana/dexes au run precedent. Ils sont
+# malgre tout re-resolus a chaque run, et un id absent de la reponse est
+# ignore avec un warning plutot que devine.
+#   raydium 5,9 j et meteora 43,3 j sont mesures ; les six autres sont a
+#   mesurer, aucune hypothese sur leur productivite.
+PREFERRED_DEXES = (
+    "raydium",
+    "meteora",
+    "raydium-clmm",
+    "meteora-damm-v2",
+    "meteora-dbc",
+    "bags-fm",
+    "heaven",
+    "boop-fun",
+)
 
 # Quote assets et LST : ils apparaissent en base_token sur certains pools
 # mais ne sont jamais des winners recherches.
@@ -170,9 +183,9 @@ SourceSpec = tuple[str, Callable[[int], "gt.PoolPage | None"], int]
 def resolve_dexes() -> list[str]:
     """Identifiants de DEX reellement exposes par l'API, parmi les souhaites.
 
-    Un seul appel. On ne code aucun identifiant en dur : chaque valeur
-    retournee vient de /networks/solana/dexes. Un DEX souhaite mais absent
-    de la reponse est ignore, pas devine.
+    Un seul appel. Chaque valeur retournee vient de /networks/solana/dexes :
+    un DEX souhaite mais absent de la reponse est ignore, jamais devine ni
+    remplace par un id approchant.
     """
     data = gt.dexes()
     if data is None:
@@ -185,16 +198,13 @@ def resolve_dexes() -> list[str]:
     available = [d.get("id") for d in data if isinstance(d.get("id"), str)]
     log.info("DEX disponibles (%d) : %s", len(available), ", ".join(available))
 
+    # Correspondance exacte, sans repli sur une variante : PREFERRED_DEXES ne
+    # contient plus que des ids observes dans une reponse reelle. Un repli
+    # substituerait silencieusement un autre DEX a celui qu'on veut mesurer.
     resolved: list[str] = []
     for wanted in PREFERRED_DEXES:
         if wanted in available:
             resolved.append(wanted)
-            continue
-        # Variantes du type 'raydium-clmm' quand l'id simple n'existe pas.
-        variant = next((d for d in available if d.startswith(f"{wanted}-")), None)
-        if variant:
-            log.info("DEX '%s' absent, variante retenue : '%s'", wanted, variant)
-            resolved.append(variant)
         else:
             log.warning("DEX '%s' absent de la reponse, ignore", wanted)
 
@@ -210,9 +220,6 @@ def build_source_specs(dex_ids: list[str]) -> list[SourceSpec]:
          TRENDING_POOLS_PAGES)
         for duration in TRENDING_DURATIONS
     ]
-    specs.append(
-        ("pools_volume", partial(gt.top_pools, sort=VOLUME_SORT), TOP_POOLS_PAGES)
-    )
     specs.extend(
         (f"dex_{dex}", partial(gt.dex_pools, dex, sort=VOLUME_SORT), DEX_POOLS_PAGES)
         for dex in dex_ids

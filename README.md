@@ -16,7 +16,7 @@ serviront ensuite a identifier les wallets.
 | `supabase_client.py` | Lecture / upsert sur `sol_analyzed_tokens` |
 | `main.py` | Point d'entree, dispatch via `RUN_MODE` |
 | `find_winners.py` | Pipeline de discovery |
-| `probe_megafilter.py` | Sonde jetable sur `/pools/megafilter`, independante du pipeline |
+| `probe_sort.py` | Sonde jetable : le tri de `/pools` est-il applique ? |
 
 ## Installation
 
@@ -47,13 +47,13 @@ Point d'entree unique : `main.py`, qui lit `RUN_MODE`.
 
 ```bash
 RUN_MODE=winners python main.py   # defaut : pipeline de discovery
-RUN_MODE=probe   python main.py   # sonde megafilter uniquement
+RUN_MODE=probe   python main.py   # sonde de tri uniquement
 ```
 
 | `RUN_MODE` | Effet |
 | --- | --- |
 | `winners` (defaut, valeur vide incluse) | pipeline de discovery |
-| `probe` | sonde megafilter, le pipeline n'est pas lance |
+| `probe` | sonde de tri, le pipeline n'est pas lance |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -63,11 +63,11 @@ RUN_MODE=probe   python main.py   # sonde megafilter uniquement
 
 ## Pipeline
 
-1. **Collecte** — 9 sources, 71 appels (~2,5 min de throttle) :
+1. **Collecte** — 12 sources, 101 appels (~3,5 min de throttle) :
    `trending_pools` sur les 4 durees (5m, 1h, 6h, 24h), p. 1-5 chacune ;
-   `pools?sort=h24_volume_usd_desc`, p. 1-10 ; puis les pools de chaque DEX
-   retenu, meme tri, p. 1-10. Jamais de page > 10 : la pagination au dela
-   est reservee aux plans payants et le client refuse l'appel.
+   puis les pools de chaque DEX retenu en `sort=h24_volume_usd_desc`,
+   p. 1-10. Jamais de page > 10 : la pagination au dela est reservee aux
+   plans payants et le client refuse l'appel.
 2. **Deduplication par mint**, pas par pool : un token a souvent plusieurs
    pools, on garde le plus liquide.
 3. **Exclusion du bruit** : SOL, wSOL, USDC, USDT et les LST (JitoSOL, mSOL,
@@ -113,30 +113,54 @@ calculee des qu'elle est calculable, y compris quand `perf_x` ne l'est pas.
 
 ## Pourquoi cette topologie de collecte
 
-Mesure du run du 17/09, sur 500 pools collectes :
+La collecte se recalibre a chaque run sur l'**age median mesure par
+source** : une source dont la mediane est structurellement hors de la
+fenetre 7-60 j est retiree, pas ajustee.
 
-| Source | Age median | Verdict |
+Mesures du run du 17/09 (1400 pools) :
+
+| Source | Age median | Decision |
 | --- | --- | --- |
-| `new_pools` | 0,0 j | aucun pool ne peut atteindre la fenetre |
-| `pools` (tri par defaut `h24_tx_count_desc`) | 0,4 j | idem |
-| `trending_pools` | 28,6 j | seule source dans la fenetre |
+| `dex_orca` | 404,1 j | retiree |
+| `trending_1h` | 87,8 j | conservee, marginale |
+| `dex_meteora` | 43,3 j | conservee |
+| `trending_6h` | 39,5 j | conservee |
+| `trending_24h` | 28,6 j | conservee |
+| `dex_raydium` | 5,9 j | conservee |
+| `trending_5m` | 1,6 j | conservee, marginale |
+| `pools_volume` | 0,4 j | retiree |
+| `dex_pumpswap` | 0,3 j | retiree |
+| `new_pools` (run precedent) | 0,0 j | retiree |
 
-403 des 500 pools partaient en `age_trop_jeune`, 51 en `age_trop_vieux`, et
-**aucun** en liquidite ou volume. Le goulot etait la collecte, pas les
-seuils — qui n'ont donc pas ete touches.
+Retirer `pools_volume`, `dex_pumpswap` et `dex_orca` libere 30 appels,
+reinvestis dans six DEX supplementaires a mesurer : `raydium-clmm`,
+`meteora-damm-v2`, `meteora-dbc`, `bags-fm`, `heaven`, `boop-fun`. Aucune
+hypothese sur leur productivite — c'est leur age median au prochain run qui
+tranchera.
 
-D'ou les trois changements : `new_pools` retire (il reviendra pour une
-logique d'accumulation), `pools` trie par volume plutot que par nombre de
-transactions (le volume favorise les pools etablies, donc plus agees), et
-les 4 durees de `trending_pools` interrogees separement.
+`pools_volume` a rendu le meme age median (0,4 j) avec et sans
+`sort=h24_volume_usd_desc`, d'ou le soupcon que le parametre de tri est
+ignore. C'est ce que mesure `RUN_MODE=probe` (voir plus bas).
 
 Les identifiants de DEX **ne sont pas codes en dur** : `resolve_dexes()`
 appelle `/networks/solana/dexes` au demarrage et ne retient que les ids
-reellement presents dans la reponse. Un DEX souhaite mais absent est ignore
-avec un log ; si l'id simple manque mais qu'une variante existe
-(`meteora` -> `meteora-dlmm`), la variante est retenue et signalee. Si
-l'appel echoue, la collecte par DEX est desactivee pour le run et les autres
-sources continuent.
+reellement presents dans la reponse, en **correspondance exacte**. Un DEX
+souhaite mais absent est ignore avec un warning, jamais remplace par un id
+approchant : un repli substituerait silencieusement un autre DEX a celui
+qu'on veut mesurer. Si l'appel echoue, la collecte par DEX est desactivee
+pour le run et les autres sources continuent.
+
+## La sonde `RUN_MODE=probe`
+
+`probe_sort.py` repond a une seule question : le parametre de tri de
+`/networks/solana/pools` est-il applique ? Trois appels sur `page=1`, sans
+tri, avec `sort=`, avec `order=`. Pour chacun : premiere adresse, derniere
+adresse, age median de la page. Meme premiere adresse partout -> le tri est
+ignore, et c'est logue comme tel. La comparaison des sequences completes
+sert de preuve plus forte que la seule premiere adresse.
+
+Elle remplace l'ancienne sonde megafilter : cet endpoint est reserve aux
+plans payants et n'est pas exploitable sur la cle Demo.
 
 La deduplication par mint devient critique ici : les 9 sources se recoupent
 largement. Le pool le plus liquide de chaque token est conserve, les autres
@@ -177,7 +201,7 @@ ecrit `NULL`, jamais `0`, pour ne pas fausser la calibration.
 
 - **Rate limit** : 2,1 s minimum entre deux appels. La cle Demo est plafonnee
   a 30 req/min et **partagee** avec l'agent ETH. Ne pas reduire l'intervalle :
-  la collecte coute 71 appels, plus un appel OHLCV par candidat retenu.
+  la collecte coute 101 appels, plus un appel OHLCV par candidat retenu.
 - **Pertes explicites** : tout appel abandonne apres retries logue
   `PERTE : <endpoint> abandonne apres N tentatives` et retourne `None`. Jamais
   de liste vide silencieuse.

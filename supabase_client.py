@@ -9,6 +9,9 @@ Colonnes attendues cote Supabase :
     symbol          text
     name            text
     pool_address    text
+    dex             text         (identifiant DEX : raydium, pumpswap...)
+    pool_created_at timestamptz  (date de creation du pool retenu)
+    fdv_usd         numeric      (NULL si absent du payload, jamais 0)
     liquidity_usd   numeric
     volume_24h_usd  numeric
     perf_x          numeric

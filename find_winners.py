@@ -66,6 +66,20 @@ def _to_float(value: Any) -> float:
         return 0.0
 
 
+def _to_float_or_none(value: Any) -> float | None:
+    """Comme _to_float, mais distingue 'absent' de 'zero'.
+
+    Un FDV manquant ecrit comme 0 fausserait la calibration ulterieure de la
+    fenetre de mcap : on preserve le NULL.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _base_mint(pool: dict) -> str | None:
     """Mint du base_token, extrait de l'id relationnel 'solana_<mint>'."""
     token_id = (
@@ -79,7 +93,8 @@ def _base_mint(pool: dict) -> str | None:
     return token_id.split("_", 1)[1]
 
 
-def _pool_age_days(created_at: str | None, now: datetime) -> float | None:
+def _parse_created_at(created_at: str | None) -> datetime | None:
+    """'2024-01-15T12:00:00Z' -> datetime aware, ou None si illisible."""
     if not created_at:
         return None
     try:
@@ -88,7 +103,22 @@ def _pool_age_days(created_at: str | None, now: datetime) -> float | None:
         return None
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
+    return created
+
+
+def _pool_age_days(created: datetime, now: datetime) -> float:
     return (now - created).total_seconds() / 86400.0
+
+
+def _dex_id(pool: dict) -> str | None:
+    """Identifiant du DEX ('raydium', 'pumpswap', 'meteora'...)."""
+    dex_id = (
+        pool.get("relationships", {})
+        .get("dex", {})
+        .get("data", {})
+        .get("id")
+    )
+    return dex_id if isinstance(dex_id, str) and dex_id else None
 
 
 def _symbol_from_pool_name(pool: dict) -> str:
@@ -168,8 +198,11 @@ def build_candidates(pools: list[dict], token_index: dict[str, dict]) -> list[di
         if symbol.upper() in NOISE_SYMBOLS:
             continue
 
-        age = _pool_age_days(attrs.get("pool_created_at"), now)
-        if age is None or not (MIN_POOL_AGE_DAYS <= age <= MAX_POOL_AGE_DAYS):
+        created = _parse_created_at(attrs.get("pool_created_at"))
+        if created is None:
+            continue
+        age = _pool_age_days(created, now)
+        if not (MIN_POOL_AGE_DAYS <= age <= MAX_POOL_AGE_DAYS):
             continue
 
         liquidity = _to_float(attrs.get("reserve_in_usd"))
@@ -186,6 +219,9 @@ def build_candidates(pools: list[dict], token_index: dict[str, dict]) -> list[di
             "symbol": symbol,
             "name": token_attrs.get("name") or attrs.get("name") or symbol,
             "pool_address": pool_address,
+            "dex": _dex_id(pool),
+            "pool_created_at": created.isoformat(),
+            "fdv_usd": _to_float_or_none(attrs.get("fdv_usd")),
             "liquidity_usd": round(liquidity, 2),
             "volume_24h_usd": round(volume_24h, 2),
         }
@@ -283,6 +319,16 @@ def run() -> int:
 
     if lost:
         log.warning("OHLCV : %d token(s) perdus, retentes au prochain run", lost)
+
+    # Ces colonnes sont nullables : un payload incomplet passerait l'upsert
+    # sans erreur et la perte serait silencieuse. On l'annonce.
+    missing_dex = sum(1 for r in analyzed if not r.get("dex"))
+    missing_fdv = sum(1 for r in analyzed if r.get("fdv_usd") is None)
+    if missing_dex or missing_fdv:
+        log.warning(
+            "Payload incomplet sur %d lignes : dex absent %d | fdv_usd absent %d",
+            len(analyzed), missing_dex, missing_fdv,
+        )
 
     # Winners ET non-winners sont ecrits : c'est ce qui alimente la memoire
     # et evite de re-analyser les memes tokens a chaque run.

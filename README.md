@@ -72,8 +72,16 @@ token sera retente au prochain run plutot qu'enterre dans la memoire.
 ## Table `sol_analyzed_tokens`
 
 Colonnes attendues : `mint` (unique), `symbol`, `name`, `pool_address`,
-`liquidity_usd`, `volume_24h_usd`, `perf_x`, `peak_at`, `is_winner`,
-`rejected_reason`, `analyzed_at`.
+`dex`, `pool_created_at`, `fdv_usd`, `liquidity_usd`, `volume_24h_usd`,
+`perf_x`, `peak_at`, `is_winner`, `rejected_reason`, `analyzed_at`.
+
+`dex`, `pool_created_at` et `fdv_usd` viennent du payload des endpoints de
+liste (aucun appel supplementaire) et sont ecrites pour **tous** les
+candidats analyses, winners comme rejetes : elles serviront a calibrer la
+fenetre de mcap cible et le seuil d'age. Ces colonnes etant nullables, un
+payload incomplet passerait l'upsert sans erreur — le run logue donc un
+avertissement quand `dex` ou `fdv_usd` manquent. Un `fdv_usd` absent est
+ecrit `NULL`, jamais `0`, pour ne pas fausser la calibration.
 
 ## Contraintes de conception
 

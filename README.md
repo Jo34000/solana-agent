@@ -173,88 +173,50 @@ plans payants et n'est pas exploitable sur la cle Demo.
 
 Premiere brique de la **phase 2** : retrouver les premiers acheteurs des
 winners de la phase 1. `probe_helius.py` ne fait que sonder — aucune
-ecriture en base, aucun parsing, aucune notion d'acheteur ni de rang. Le but
-est de connaitre la forme reelle des reponses avant d'ecrire le parsing.
+ecriture en base, aucun parsing metier, aucune notion d'acheteur ni de rang.
 
-Deux mints winners reels, un de chaque famille (CATE sur pump.fun, STONK
-hors pump), et deux voies d'acces par mint :
+### Acquis du run du 17/09 20:22
 
-| Voie | Appel |
+- `getTransactionsForAddress` (JSON-RPC) repond en HTTP 200 et renvoie
+  `result = {"data": [...]}`, **pas une liste**. La sonde testait
+  `isinstance(result, list)` et concluait a un echec sur des donnees
+  presentes : bug corrige.
+- **L'ordre ascendant est confirme** : `blockTime` et `slot` croissants.
+  C'est ce qui rend cette voie exploitable pour des early buyers.
+  (`transactionIndex` se remet a zero a chaque slot : il est croissant
+  dans un slot, pas d'un slot a l'autre.)
+- Les elements renvoyes ne portent que `signature`, `slot`,
+  `transactionIndex`, `err`, `memo`, `blockTime`, `confirmationStatus` :
+  pas de `tokenTransfers`. **Une etape d'enrichissement est necessaire.**
+- La voie REST par adresse (`/v0/addresses/{addr}/transactions`) renvoyait
+  l'ordre **descendant** : inutilisable ici. Elle n'est plus testee.
+
+### Ce que la sonde fait maintenant
+
+| Voie | Objet |
 | --- | --- |
-| A | `getTransactionsForAddress` sur l'endpoint JSON-RPC |
-| B | API Enhanced Transactions REST, en repli |
+| A | `getTransactionsForAddress`, corps de requete logue, ordre verifie |
+| A-bis | la meme methode peut-elle rendre les transactions completes ? |
+| C | enrichissement par signature, `POST /v0/transactions` |
+| D | transactions partageant le slot de la premiere |
 
-Pour chaque appel : code HTTP, message d'erreur **brut** de Helius, nombre
-de transactions, horodatage de la premiere et de la derniere du lot (pour
-verifier l'ordre chronologique), et la structure complete de la premiere
-transaction en JSON indente, tronquee a 4000 caracteres. Puis les champs
-reperes dans cette transaction : signataire, transferts (avec les noms de
-champs qui portent source, destination et montant), programme et type.
+La voie A-bis essaie plusieurs noms de parametre (`encoding`,
+`transactionDetails`, `showTransactionDetails`). **Aucun n'est certain** :
+un rejet est une information, et le message brut de Helius donne le nom
+correct. Chaque variante logue la config envoyee, le code HTTP et, si elle
+passe, les cles obtenues au-dela des metadonnees.
 
-Les messages d'erreur sont affiches tels quels avec le corps de requete
-envoye : ce sont eux qui donneront le bon nom de methode ou de parametre si
-la voie A n'existe pas sous ce nom.
+La voie C prend les 5 premieres signatures avec `err == null` et les poste
+a l'API Enhanced Transactions. Elle logue la structure complete d'une
+transaction (JSON indente, tronque a 4000 caracteres) puis nomme les champs
+reperes : signataire, transferts avec les champs portant source,
+destination, montant et mint, programme et type.
+
+Le recapitulatif final dit `donnees exploitables` en fonction de la
+**presence de donnees**, jamais du type Python renvoye par l'API — c'est
+exactement ce qui avait produit le faux negatif.
 
 `HELIUS_API_KEY` absente dans ce mode : la sonde **leve**, elle ne continue
-pas. La cle n'apparait jamais dans les logs, les URL sont masquees. Le
-throttle Helius (0,5 s) est **dedie** et independant de celui de CoinGecko :
-free tier a 10 req/s, la sonde n'en fait que 4.
-
-La deduplication par mint devient critique ici : les 9 sources se recoupent
-largement. Le pool le plus liquide de chaque token est conserve, les autres
-sont comptes en `doublon_pool`.
-
-## Lire l'entonnoir de collecte
-
-Chaque run logue une ligne par source avec l'age median des pools retournes,
-puis une ligne de synthese du filtrage :
-
-```
-new_pools        : 200 pools, age median 0,8 j
-filtrage : doublon_pool 120 | bruit 8 | age_trop_jeune 210 | age_trop_vieux 0 | ...
-```
-
-Les motifs sont mutuellement exclusifs et verifient l'invariant
-`collectes = somme(motifs hors deja_analyse) + dedupliques`. Ventiler
-`age_trop_jeune` et `age_trop_vieux` separement est le point cle : c'est ce
-qui dit si la fenetre d'age est mal placee ou si les endpoints collectent a
-cote de la cible.
-
-## Table `sol_analyzed_tokens`
-
-Colonnes attendues : `mint` (unique), `symbol`, `name`, `pool_address`,
-`dex`, `pool_created_at`, `fdv_usd`, `liquidity_usd`, `volume_24h_usd`,
-`perf_x`, `perf_x_launch`, `peak_at`, `is_winner`, `rejected_reason`,
-`analyzed_at`.
-
-`dex`, `pool_created_at` et `fdv_usd` viennent du payload des endpoints de
-liste (aucun appel supplementaire) et sont ecrites pour **tous** les
-candidats analyses, winners comme rejetes : elles serviront a calibrer la
-fenetre de mcap cible et le seuil d'age. Ces colonnes etant nullables, un
-payload incomplet passerait l'upsert sans erreur — le run logue donc un
-avertissement quand `dex` ou `fdv_usd` manquent. Un `fdv_usd` absent est
-ecrit `NULL`, jamais `0`, pour ne pas fausser la calibration.
-
-## Contraintes de conception
-
-- **Rate limit** : 2,1 s minimum entre deux appels. La cle Demo est plafonnee
-  a 30 req/min et **partagee** avec l'agent ETH. Ne pas reduire l'intervalle :
-  la collecte coute 61 appels, plus un appel OHLCV par candidat retenu.
-- **Pertes explicites** : tout appel abandonne apres retries logue
-  `PERTE : <endpoint> abandonne apres N tentatives` et retourne `None`. Jamais
-  de liste vide silencieuse.
-- **Ecritures verifiees** : aucune exception d'ecriture n'est avalee, et une
-  ecriture partielle leve. Un `except` qui retourne `[]` fait croire a un
-  succes alors que la table (RLS) reste vide.
-- **Logs** : une synthese par etape, jamais une ligne par enregistrement.
-- **Aucun etat sur le filesystem** : Railway est ephemere, tout ce qui doit
-  survivre va en base.
-
-## Volume de winners
-
-La base **s'alimente par accumulation** : chaque run n'analyse que les mints
-absents de `sol_analyzed_tokens` depuis moins de `ANALYZED_TTL_DAYS`, si bien
-que des runs hebdomadaires empilent des winners nouveaux au lieu de
-re-mesurer les memes. Le compte d'un run isole n'est donc pas un objectif a
-atteindre : le run logue `winners ce run : N` a titre informatif, sans
-avertissement.
+pas. La cle n'apparait jamais dans les logs, URL et corps de requete sont
+masques. Le throttle Helius (0,5 s) est **dedie** et independant de celui
+de CoinGecko : free tier a 10 req/s, la sonde fait une dizaine d'appels.

@@ -91,9 +91,15 @@ PERF_CAP = 20.0
 MIN_POOL_LIQUIDITY_USD = 5_000
 
 # AJUSTABLE - echantillon de tokens mesures par wallet. Ce sont les plus
-# RECENTS qui sont gardes, jamais les plus performants : trier sur le gain
-# biaiserait le win rate.
+# RECENTS des achats MATURES qui sont gardes, jamais les plus performants :
+# trier sur le gain biaiserait le win rate.
 VALIDATION_MAX_TOKENS_PER_WALLET = 30
+
+# AJUSTABLE - age minimum d'un achat pour etre mesurable. En dessous, deux
+# biais se cumulent : le token n'a pas eu le temps de performer, et un
+# lancement pump.fun trop recent n'est pas encore indexe par GeckoTerminal,
+# donc classe MORT a tort.
+VALIDATION_MIN_TOKEN_AGE_DAYS = 10
 
 # --------------------------------------------------------------------------
 # Constantes techniques (non ajustables a la volee)

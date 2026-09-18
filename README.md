@@ -247,18 +247,24 @@ construction. Le backtest reconstitue son historique d'achats reel.
 4. Un achat est une entree de `tokenTransfers` dont `toUserAccount` est le
    wallet et dont le mint n'est pas du bruit. Comme en phase 2, une vente
    dans la meme transaction n'annule pas une reception.
-5. Sur les achats extraits, seuls les **30 plus recents**
-   (`VALIDATION_MAX_TOKENS_PER_WALLET`) sont mesures. C'est un echantillon,
-   jamais une selection sur la performance : trier par gain biaiserait
-   mecaniquement le win rate. La troncature est loguee
-   (`201 achats, 30 echantillonnes`).
+5. Seuls les achats **matures** sont mesurables : plus vieux que
+   `VALIDATION_MIN_TOKEN_AGE_DAYS`. Parmi eux, les **30 plus recents**
+   (`VALIDATION_MAX_TOKENS_PER_WALLET`). C'est un echantillon, jamais une
+   selection sur la performance : trier par gain biaiserait mecaniquement le
+   win rate. La ligne loguee donne la fenetre reellement mesuree
+   (`199 achats, 47 matures, 30 echantillonnes (achats de 11 a 38 j)`).
+   Moins de `VALIDATION_MIN_TOKENS` achats matures ->
+   `historique_trop_recent`, rendu **sans aucun appel de marche**.
 6. Par mint : pool le plus liquide via `/tokens/{mint}/pools`, puis OHLCV
    journalier sur 180 jours. `perf = max(high APRES l'achat) / close du jour
    d'achat`, **cappee a `PERF_CAP` avant toute mediane**.
 7. Verdict : `active` si `tokens_evaluated >= VALIDATION_MIN_TOKENS` **et**
    `win_rate >= VALIDATION_MIN_WIN_RATE` **et**
    `rug_rate <= VALIDATION_MAX_RUG_RATE`. `validated_at` est ecrit dans tous
-   les cas, echec compris — mais jamais en cas de **PERTE**.
+   les cas, echec compris — mais jamais en cas de **PERTE**. Trois raisons de
+   non-activation sont distinguees : `backtest_echoue`,
+   `historique_insuffisant` (assez d'achats matures, mais trop peu
+   mesurables) et `historique_trop_recent` (pas assez d'achats matures).
 8. L'ecriture se fait **wallet par wallet, au fil de l'eau** : un arret du
    service ne fait pas rejouer les wallets deja backtestes. Une ligne de
    progression est loguee toutes les 10 wallets.
@@ -277,10 +283,27 @@ Le **seul** cas ou un token sort du decompte : un token *vivant* dont
 l'OHLCV est vide ou corrompu, ou un echec reseau. Il est logue a part comme
 `non mesurable`, distinct des rugs.
 
-C'est le correctif central de cette version : ecarter les tokens a faible
-liquidite revenait a ne mesurer que les succes. Le resume donne, par wallet
-et au total, le nombre de tokens morts / rugs / vivants / non mesurables —
-sans quoi un win rate ne veut rien dire.
+Ecarter les tokens a faible liquidite revenait a ne mesurer que les succes.
+Le resume donne, par wallet et au total, le nombre de tokens morts / rugs /
+vivants / non mesurables — sans quoi un win rate ne veut rien dire.
+
+### Pourquoi la maturite
+
+Run du 18/09 12:45, premier wallet : 23 tokens mesures, **18 morts, 5 rugs,
+0 vivant**, win rate 0. L'echantillon "les 30 plus recents" couvrait les
+derniers jours d'activite, ou deux biais se cumulent :
+
+- un token achete il y a deux jours n'a pas eu le temps de performer ;
+- un lancement pump.fun trop recent n'est pas encore indexe par
+  GeckoTerminal, donc classe **MORT a tort**.
+
+Et surtout, les winners qui ont fait de ce wallet un candidat datent de 7 a
+60 jours : ils etaient systematiquement hors de la fenetre mesuree.
+
+`VALIDATION_MIN_TOKEN_AGE_DAYS` ecarte les achats trop jeunes avant
+l'echantillonnage. La ligne par wallet affiche l'age du plus ancien et du
+plus recent achat retenu, ce qui permet de verifier que la fenetre mesuree
+est bien celle des winners.
 
 ### Pas de plancher d'activite
 

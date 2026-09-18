@@ -32,6 +32,7 @@ from config import (
     VALIDATION_MAX_RUG_RATE,
     VALIDATION_MAX_TOKENS_PER_WALLET,
     VALIDATION_MAX_TX,
+    VALIDATION_MIN_TOKEN_AGE_DAYS,
     VALIDATION_MIN_TOKENS,
     VALIDATION_MIN_WIN_RATE,
     VALIDATION_MIN_WINNERS,
@@ -296,6 +297,9 @@ def validate_wallet(wallet: str) -> dict | None:
         verdict = build_verdict(wallet, [], 0)
         verdict["_counts"] = Counter()
         verdict["_bought"] = 0
+        verdict["_mature"] = 0
+        verdict["_sampled"] = 0
+        verdict["_ages"] = ()
         return verdict
 
     enriched = helius.enrich_signatures([item["signature"] for item in usable])
@@ -308,11 +312,31 @@ def validate_wallet(wallet: str) -> dict | None:
     chronological = sorted(enriched, key=lambda t: _to_float(t.get("timestamp")))
     purchases = extract_purchases(chronological, wallet)
 
-    # Echantillon des plus RECENTS. Jamais un tri sur la performance : cela
-    # biaiserait mecaniquement le win rate.
+    # Seuls les achats MATURES sont mesurables. En dessous de
+    # VALIDATION_MIN_TOKEN_AGE_DAYS, deux biais se cumulent : le token n'a
+    # pas eu le temps de performer, et un lancement pump.fun trop recent
+    # n'est pas encore indexe par GeckoTerminal, donc classe MORT a tort.
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cutoff = now_ts - VALIDATION_MIN_TOKEN_AGE_DAYS * 86400
+    mature = [p for p in purchases.values() if p["bought_at"] <= cutoff]
+
+    # Echantillon des plus RECENTS parmi les matures. Jamais un tri sur la
+    # performance : cela biaiserait mecaniquement le win rate.
     sample = sorted(
-        purchases.values(), key=lambda p: p["bought_at"], reverse=True
+        mature, key=lambda p: p["bought_at"], reverse=True
     )[:VALIDATION_MAX_TOKENS_PER_WALLET]
+    ages = sorted((now_ts - p["bought_at"]) / 86400 for p in sample)
+
+    if len(mature) < VALIDATION_MIN_TOKENS:
+        # Verdict rendu sans aucun appel de marche : il n'y a rien a mesurer.
+        verdict = build_verdict(wallet, [], 0)
+        verdict["activation_reason"] = "historique_trop_recent"
+        verdict["_bought"] = len(purchases)
+        verdict["_mature"] = len(mature)
+        verdict["_sampled"] = 0
+        verdict["_ages"] = ()
+        verdict["_counts"] = Counter()
+        return verdict
 
     perfs: list[float] = []
     rugs = 0
@@ -332,7 +356,9 @@ def validate_wallet(wallet: str) -> dict | None:
 
     verdict = build_verdict(wallet, perfs, rugs)
     verdict["_bought"] = len(purchases)
+    verdict["_mature"] = len(mature)
     verdict["_sampled"] = len(sample)
+    verdict["_ages"] = (ages[0], ages[-1]) if ages else ()
     verdict["_counts"] = counts
     return verdict
 
@@ -399,18 +425,21 @@ def run() -> int:
             continue
 
         bought = verdict.pop("_bought", 0)
+        mature = verdict.pop("_mature", 0)
         sampled = verdict.pop("_sampled", 0)
+        ages = verdict.pop("_ages", ())
         counts = verdict.pop("_counts", Counter())
         totals.update(counts)
 
-        sampling = (
-            f"{bought} achats, {sampled} echantillonnes"
-            if sampled < bought else f"{bought} achats"
-        )
+        # Cette ligne est ce qui permet de verifier que la fenetre mesuree
+        # est la bonne : un echantillon trop jeune ne mesure rien.
+        window = f" (achats de {ages[0]:.0f} a {ages[1]:.0f} j)" if ages else ""
         log.info(
-            "%s... : %s | %d mesures (morts %d / rugs %d / vivants %d, "
-            "non mesurables %d) | win %s | mediane %s | rug %s | %s",
-            wallet[:8], sampling, verdict["tokens_evaluated"],
+            "%s... : %d achats, %d matures, %d echantillonnes%s | %d mesures "
+            "(morts %d / rugs %d / vivants %d, non mesurables %d) | win %s "
+            "| mediane %s | rug %s | %s",
+            wallet[:8], bought, mature, sampled, window,
+            verdict["tokens_evaluated"],
             counts["mort"], counts["rug"], counts["vivant"],
             counts["non_mesurable"],
             verdict["win_rate"], verdict["median_perf"], verdict["rug_rate"],
@@ -441,14 +470,18 @@ def run() -> int:
 
     valid = [v for v in verdicts if v["activation_reason"] == "backtest_valide"]
     thin = [v for v in verdicts if v["activation_reason"] == "historique_insuffisant"]
+    too_recent = [
+        v for v in verdicts if v["activation_reason"] == "historique_trop_recent"
+    ]
     helius_calls, helius_losses = helius.request_stats()
     gecko_calls, gecko_losses = gt.request_stats()
 
     log.info("=== Resume ===")
     log.info(
         "candidats %d | backtestes %d | valides %d | historique insuffisant "
-        "%d | exclus bot %d",
-        len(candidates), len(verdicts), len(valid), len(thin), bots,
+        "%d | trop recent %d | exclus bot %d",
+        len(candidates), len(verdicts), len(valid), len(thin),
+        len(too_recent), bots,
     )
     log.info(
         "tokens : morts %d | rugs %d | vivants %d | non mesurables %d",

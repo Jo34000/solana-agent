@@ -19,7 +19,6 @@ from __future__ import annotations
 import logging
 import math
 import statistics
-import sys
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
@@ -30,6 +29,7 @@ import supabase_client as db
 from config import (
     MIN_POOL_LIQUIDITY_USD,
     PERF_CAP,
+    VALIDATION_MAX_PAGES,
     VALIDATION_MAX_RUG_RATE,
     VALIDATION_MAX_TOKENS_PER_WALLET,
     VALIDATION_MAX_TX,
@@ -37,6 +37,7 @@ from config import (
     VALIDATION_MIN_TOKENS,
     VALIDATION_MIN_WIN_RATE,
     VALIDATION_MIN_WINNERS,
+    VALIDATION_TARGET_AGE_DAYS,
     VALIDATION_TX_LIMIT,
     VALIDATION_WIN_MULTIPLE,
     diagnose_environment,
@@ -273,51 +274,116 @@ def build_verdict(wallet: str, perfs: list[float], rugs: int) -> dict:
     }
 
 
+def collect_transactions(
+    wallet: str,
+) -> tuple[list[dict], int, str, dict] | None:
+    """Pagine la voie A jusqu'a la profondeur visee.
+
+    Retourne (transactions, pages lues, motif d'arret, result de la 1re
+    page). None = PERTE.
+
+    Mesure du 18/09 : 500 transactions couvrent 3 heures chez un wallet tres
+    actif. Une seule page ne peut donc jamais atteindre la fenetre 7-60 j ou
+    se trouvent les winners.
+    """
+    target_ts = (
+        datetime.now(timezone.utc).timestamp()
+        - VALIDATION_TARGET_AGE_DAYS * 86400
+    )
+    collected: list[dict] = []
+    token: str | None = None
+    pages = 0
+    first_result: dict = {}
+
+    while pages < VALIDATION_MAX_PAGES:
+        detailed = helius.transactions_for_address_detailed(
+            wallet, VALIDATION_TX_LIMIT, sort_order="desc", page_token=token
+        )
+        if detailed is None:  # PERTE deja loguee cote client
+            return None
+        items, result = detailed
+        pages += 1
+        if pages == 1:
+            first_result = result
+        collected.extend(items)
+
+        if not items:
+            return collected, pages, "historique_epuise", first_result
+
+        last = _to_float(items[-1].get("blockTime"))
+        if last and last <= target_ts:
+            return collected, pages, "profondeur_atteinte", first_result
+
+        token = helius.pagination_token(result)
+        if not token:
+            return collected, pages, "historique_epuise", first_result
+
+    return collected, pages, "limite_pages", first_result
+
+
 def validate_wallet(wallet: str) -> dict | None:
     """Verdict d'un wallet. None = PERTE : pas de validated_at.
 
     Retourne {"bot": True} quand le wallet depasse VALIDATION_MAX_TX.
     """
-    detailed = helius.transactions_for_address_detailed(
-        wallet, VALIDATION_TX_LIMIT, sort_order="desc"
-    )
-    if detailed is None:
+    collected = collect_transactions(wallet)
+    if collected is None:
         return None
-    transactions, result = detailed
+    transactions, pages, stop_reason, first_result = collected
 
-    total = total_transactions(result)
+    total = total_transactions(first_result)
     if total is not None and total > VALIDATION_MAX_TX:
         return {"bot": True, "total_tx": total}
 
-    usable = [
+    now_ts = datetime.now(timezone.utc).timestamp()
+    block_times = [
+        _to_float(item.get("blockTime")) for item in transactions
+        if isinstance(item, dict) and _to_float(item.get("blockTime")) > 0
+    ]
+    coverage = (
+        ((now_ts - max(block_times)) / 86400, (now_ts - min(block_times)) / 86400)
+        if block_times else (0.0, 0.0)
+    )
+
+    pagination = {
+        "pages": pages,
+        "transactions": len(transactions),
+        "coverage": coverage,
+        "stop_reason": stop_reason,
+    }
+
+    # Fenetre de maturite : entre VALIDATION_MIN_TOKEN_AGE_DAYS et
+    # VALIDATION_TARGET_AGE_DAYS. Filtrer ICI, sur le blockTime que la voie A
+    # porte deja, evite d'enrichir des transactions qu'on ecarterait ensuite.
+    newest_ts = now_ts - VALIDATION_MIN_TOKEN_AGE_DAYS * 86400
+    oldest_ts = now_ts - VALIDATION_TARGET_AGE_DAYS * 86400
+    in_window = [
         item for item in transactions
         if isinstance(item, dict) and item.get("err") is None
         and isinstance(item.get("signature"), str)
+        and oldest_ts <= _to_float(item.get("blockTime")) <= newest_ts
     ]
-    if not usable:
+    pagination["in_window"] = len(in_window)
+
+    if not in_window:
         verdict = build_verdict(wallet, [], 0)
-        verdict["_counts"] = Counter()
-        verdict["_bought"] = 0
-        verdict["_mature"] = 0
-        verdict["_sampled"] = 0
-        verdict["_ages"] = ()
+        verdict["activation_reason"] = "historique_trop_recent"
+        verdict.update(_bought=0, _mature=0, _sampled=0, _ages=(),
+                       _counts=Counter(), _pagination=pagination)
         return verdict
 
-    enriched = helius.enrich_signatures([item["signature"] for item in usable])
+    enriched = helius.enrich_signatures([item["signature"] for item in in_window])
     if enriched is None:
         return None
 
-    # La voie A est interrogee en ordre DESCENDANT (historique recent) : on
-    # remet les transactions en ordre chronologique pour que "premier achat"
-    # designe bien la plus ancienne entree de la fenetre.
+    # La voie A est interrogee en ordre DESCENDANT : on remet les
+    # transactions en ordre chronologique pour que "premier achat" designe
+    # bien la plus ancienne entree de la fenetre.
     chronological = sorted(enriched, key=lambda t: _to_float(t.get("timestamp")))
     purchases = extract_purchases(chronological, wallet)
 
-    # Seuls les achats MATURES sont mesurables. En dessous de
-    # VALIDATION_MIN_TOKEN_AGE_DAYS, deux biais se cumulent : le token n'a
-    # pas eu le temps de performer, et un lancement pump.fun trop recent
-    # n'est pas encore indexe par GeckoTerminal, donc classe MORT a tort.
-    now_ts = datetime.now(timezone.utc).timestamp()
+    # Second filtre de maturite, sur le timestamp de la voie C cette fois :
+    # c'est lui qui fait foi pour la date d'achat.
     cutoff = now_ts - VALIDATION_MIN_TOKEN_AGE_DAYS * 86400
     mature = [p for p in purchases.values() if p["bought_at"] <= cutoff]
 
@@ -332,11 +398,8 @@ def validate_wallet(wallet: str) -> dict | None:
         # Verdict rendu sans aucun appel de marche : il n'y a rien a mesurer.
         verdict = build_verdict(wallet, [], 0)
         verdict["activation_reason"] = "historique_trop_recent"
-        verdict["_bought"] = len(purchases)
-        verdict["_mature"] = len(mature)
-        verdict["_sampled"] = 0
-        verdict["_ages"] = ()
-        verdict["_counts"] = Counter()
+        verdict.update(_bought=len(purchases), _mature=len(mature), _sampled=0,
+                       _ages=(), _counts=Counter(), _pagination=pagination)
         return verdict
 
     perfs: list[float] = []
@@ -356,11 +419,11 @@ def validate_wallet(wallet: str) -> dict | None:
             rugs += 1
 
     verdict = build_verdict(wallet, perfs, rugs)
-    verdict["_bought"] = len(purchases)
-    verdict["_mature"] = len(mature)
-    verdict["_sampled"] = len(sample)
-    verdict["_ages"] = (ages[0], ages[-1]) if ages else ()
-    verdict["_counts"] = counts
+    verdict.update(
+        _bought=len(purchases), _mature=len(mature), _sampled=len(sample),
+        _ages=(ages[0], ages[-1]) if ages else (),
+        _counts=counts, _pagination=pagination,
+    )
     return verdict
 
 
@@ -385,102 +448,6 @@ def _distribution(verdicts: list[dict]) -> None:
             log.info("  %3d-%3d%% : %-3d %s", low, low + 9, count, "#" * count)
 
 
-# ---------------------------------------------------------------------------
-# MODE DIAGNOSTIC (temporaire)
-#
-# Run du 18/09 12:56 : tous les wallets rendent "N achats, 0 matures". Deux
-# hypotheses a departager avant toute correction :
-#   H1 : la voie A limit=500 en ordre descendant ne couvre que les derniers
-#        jours d'activite de ces wallets tres actifs.
-#   H2 : erreur d'unite ou de comparaison sur la date d'achat.
-#
-# Ce bloc n'observe que. Il n'ecrit rien en base et s'arrete apres
-# DIAGNOSTIC_WALLETS wallets, pour ne pas consommer le quota.
-# ---------------------------------------------------------------------------
-
-DIAGNOSTIC_WALLETS = 3
-
-
-def _both_units(value: Any) -> str:
-    """Rend la valeur lue en SECONDES et en MILLISECONDES.
-
-    C'est la lecture qui tranche H2 : si l'interpretation en secondes donne
-    1970 et celle en millisecondes une date plausible, l'unite est en cause.
-    """
-    if not isinstance(value, (int, float)):
-        return f"{value!r} ({type(value).__name__}) - non numerique"
-    parts = []
-    for label, divisor in (("s", 1), ("ms", 1000)):
-        try:
-            moment = datetime.fromtimestamp(value / divisor, tz=timezone.utc)
-            parts.append(f"lu en {label} -> {moment.isoformat()}")
-        except (OverflowError, OSError, ValueError):
-            parts.append(f"lu en {label} -> hors plage")
-    return f"{value!r} ({type(value).__name__}) | " + " | ".join(parts)
-
-
-def diagnose_wallet(wallet: str) -> None:
-    """Trace les dates d'un wallet, de la voie A jusqu'au calcul d'age."""
-    log.info("--- DIAGNOSTIC %s ---", wallet)
-
-    detailed = helius.transactions_for_address_detailed(
-        wallet, VALIDATION_TX_LIMIT, sort_order="desc"
-    )
-    if detailed is None:
-        log.warning("  voie A perdue, rien a tracer")
-        return
-    transactions, result = detailed
-
-    log.info("  voie A : %d transactions renvoyees (limit demandee %d)",
-             len(transactions), VALIDATION_TX_LIMIT)
-    log.info("  voie A : cles de result = %s", sorted(result.keys()))
-    if transactions:
-        first, last = transactions[0], transactions[-1]
-        log.info("  voie A PREMIERE tx : blockTime %s",
-                 _both_units(first.get("blockTime")))
-        log.info("  voie A DERNIERE  tx : blockTime %s",
-                 _both_units(last.get("blockTime")))
-
-    usable = [
-        item for item in transactions
-        if isinstance(item, dict) and item.get("err") is None
-        and isinstance(item.get("signature"), str)
-    ]
-    enriched = helius.enrich_signatures([item["signature"] for item in usable])
-    if enriched is None:
-        log.warning("  voie C perdue, rien a tracer")
-        return
-
-    chronological = sorted(enriched, key=lambda t: _to_float(t.get("timestamp")))
-    purchases = extract_purchases(chronological, wallet)
-
-    now_ts = datetime.now(timezone.utc).timestamp()
-    cutoff = now_ts - VALIDATION_MIN_TOKEN_AGE_DAYS * 86400
-    log.info("  maintenant        : %s", _both_units(now_ts))
-    log.info("  limite maturite   : %s", _both_units(cutoff))
-    log.info("  (un achat est mature si bought_at <= limite, soit un age "
-             ">= %d j)", VALIDATION_MIN_TOKEN_AGE_DAYS)
-
-    log.info("  %d achats extraits", len(purchases))
-    for index, purchase in enumerate(list(purchases.values())[:3], start=1):
-        raw = purchase["bought_at"]
-        age_days = (now_ts - raw) / 86400
-        log.info("  achat %d : mint %s", index, purchase["mint"])
-        log.info("    bought_at (champ 'timestamp' de la voie C) : %s",
-                 _both_units(raw))
-        log.info("    age calcule par le code : %.2f j -> mature : %s",
-                 age_days, "oui" if raw <= cutoff else "NON")
-
-    # La ligne qui tranche H1 : si le plus ancien achat atteignable a moins
-    # de VALIDATION_MIN_TOKEN_AGE_DAYS, la fenetre de collecte est en cause.
-    if purchases:
-        ages = [(now_ts - p["bought_at"]) / 86400 for p in purchases.values()]
-        log.info(
-            "  amplitude des %d achats : du plus ancien %.2f j au plus "
-            "recent %.2f j", len(ages), max(ages), min(ages),
-        )
-
-
 def run() -> int:
     setup_logging()
     diagnose_environment()
@@ -491,41 +458,27 @@ def run() -> int:
         log.info("Aucun wallet a backtester.")
         return 0
 
-    per_wallet = 1 + math.ceil(VALIDATION_TX_LIMIT / helius.ENRICH_BATCH_SIZE)
+    # La voie A est desormais paginee : le cout haut depend du nombre de
+    # pages, la voie C ne porte plus que la fenetre de maturite.
+    max_pages_total = len(candidates) * VALIDATION_MAX_PAGES
     log.info(
-        "Budget : %d wallets x %d appels Helius = %d (~%.1f min). CoinGecko : "
-        "au plus %d tokens echantillonnes, 1 a 2 appels par mint distinct "
-        "(~%.1f s), le cache absorbant les doublons",
-        len(candidates), per_wallet, len(candidates) * per_wallet,
-        len(candidates) * per_wallet * helius.MIN_REQUEST_INTERVAL_S / 60,
+        "Budget : voie A au plus %d x %d = %d appels (~%.0f min). Voie C : "
+        "seules les transactions de %d a %d j sont enrichies, par lots de %d. "
+        "CoinGecko : au plus %d tokens, 1 a 2 appels par mint distinct, le "
+        "cache absorbant les doublons",
+        len(candidates), VALIDATION_MAX_PAGES, max_pages_total,
+        max_pages_total * helius.MIN_REQUEST_INTERVAL_S / 60,
+        VALIDATION_MIN_TOKEN_AGE_DAYS, VALIDATION_TARGET_AGE_DAYS,
+        helius.ENRICH_BATCH_SIZE,
         len(candidates) * VALIDATION_MAX_TOKENS_PER_WALLET,
-        2 * gt.MIN_REQUEST_INTERVAL_S,
     )
-
-    log.warning(
-        "MODE DIAGNOSTIC : %d wallets traces, AUCUNE ecriture en base, arret "
-        "immediat ensuite. Aucun verdict ne sera produit.",
-        DIAGNOSTIC_WALLETS,
-    )
-    traced = 0
-    for candidate in candidates:
-        wallet = candidate.get("wallet")
-        if not isinstance(wallet, str) or not wallet:
-            continue
-        diagnose_wallet(wallet)
-        traced += 1
-        if traced >= DIAGNOSTIC_WALLETS:
-            break
-    log.warning(
-        "MODE DIAGNOSTIC : %d wallets traces, arret. Rien n'a ete ecrit.",
-        traced,
-    )
-    sys.exit(0)
 
     verdicts: list[dict] = []
     bots = 0
     lost: list[str] = []
     totals: Counter = Counter()
+    pages_read = 0
+    capped = 0
 
     for index, candidate in enumerate(candidates, start=1):
         wallet = candidate.get("wallet")
@@ -546,7 +499,29 @@ def run() -> int:
         sampled = verdict.pop("_sampled", 0)
         ages = verdict.pop("_ages", ())
         counts = verdict.pop("_counts", Counter())
+        pagination = verdict.pop("_pagination", {})
         totals.update(counts)
+
+        if pagination:
+            oldest, newest = pagination["coverage"]
+            log.info(
+                "%s... : %d pages, %d tx, couverture %.0f a %.0f j "
+                "(%d dans la fenetre)",
+                wallet[:8], pagination["pages"], pagination["transactions"],
+                newest, oldest, pagination["in_window"],
+            )
+            if pagination["stop_reason"] == "limite_pages":
+                # Limite atteinte, pas un succes : la profondeur visee n'est
+                # pas couverte et des achats matures manquent peut-etre.
+                log.warning(
+                    "  %s... : LIMITE de %d pages atteinte, profondeur %d j "
+                    "NON atteinte (couverture %.0f j)",
+                    wallet[:8], VALIDATION_MAX_PAGES,
+                    VALIDATION_TARGET_AGE_DAYS, oldest,
+                )
+            pages_read += pagination["pages"]
+            if pagination["stop_reason"] == "limite_pages":
+                capped += 1
 
         # Cette ligne est ce qui permet de verifier que la fenetre mesuree
         # est la bonne : un echantillon trop jeune ne mesure rien.
@@ -599,6 +574,11 @@ def run() -> int:
         "%d | trop recent %d | exclus bot %d",
         len(candidates), len(verdicts), len(valid), len(thin),
         len(too_recent), bots,
+    )
+    log.info(
+        "pagination : %d pages lues au total | %d wallet(s) plafonnes a %d "
+        "pages sans atteindre %d j",
+        pages_read, capped, VALIDATION_MAX_PAGES, VALIDATION_TARGET_AGE_DAYS,
     )
     log.info(
         "tokens : morts %d | rugs %d | vivants %d | non mesurables %d",

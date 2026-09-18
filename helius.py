@@ -122,24 +122,36 @@ def transactions_for_address(
     return None if detailed is None else detailed[0]
 
 
+def pagination_token(result: dict) -> str | None:
+    """Jeton de page suivante, s'il y en a un."""
+    token = result.get("paginationToken")
+    return token if isinstance(token, str) and token else None
+
+
 def transactions_for_address_detailed(
-    address: str, limit: int, sort_order: str = "asc"
+    address: str,
+    limit: int,
+    sort_order: str = "asc",
+    page_token: str | None = None,
 ) -> tuple[list[dict], dict] | None:
     """(transactions, objet result brut). None = PERTE.
 
-    Helius renvoie result = {"data": [...]}, pas une liste : c'est la forme
-    confirmee par la sonde du 18/09. Le result brut est rendu tel quel pour
-    que l'appelant puisse y chercher un eventuel compteur total.
+    Helius renvoie result = {"data": [...], "paginationToken": ...}, pas une
+    liste : c'est la forme confirmee par la sonde du 18/09. Le result brut
+    est rendu tel quel pour que l'appelant y lise le jeton de pagination.
     """
     global _loss_count
     label = f"getTransactionsForAddress({address[:8]}...)"
+    config: dict[str, Any] = {"limit": limit, "sortOrder": sort_order}
+    if page_token:
+        config["paginationToken"] = page_token
     payload = _post(
         f"{RPC_URL}?api-key={api_key()}",
         {
             "jsonrpc": "2.0",
             "id": "discovery",
             "method": "getTransactionsForAddress",
-            "params": [address, {"limit": limit, "sortOrder": sort_order}],
+            "params": [address, config],
         },
         label,
     )

@@ -239,15 +239,21 @@ construction. Le backtest reconstitue son historique d'achats reel.
 
 1. Candidats : `sol_smart_wallets WHERE winners_count >=
    VALIDATION_MIN_WINNERS AND validated_at IS NULL`.
-2. Par wallet : voie A Helius en ordre **descendant** (historique recent) sur
-   `VALIDATION_TX_LIMIT` transactions, puis voie C par lots de 100.
-3. Les transactions sont **remises en ordre chronologique** avant extraction :
+2. Par wallet : voie A Helius en ordre **descendant**, **paginee** via le
+   `paginationToken` jusqu'a `VALIDATION_TARGET_AGE_DAYS` de profondeur, avec
+   `VALIDATION_MAX_PAGES` comme garde-fou.
+3. Seules les transactions dont le `blockTime` tombe dans la fenetre de
+   maturite (`VALIDATION_MIN_TOKEN_AGE_DAYS` a `VALIDATION_TARGET_AGE_DAYS`)
+   sont enrichies par la voie C, par lots de 100. Le filtre porte sur les
+   metadonnees de la voie A, qui portent deja `blockTime` : inutile
+   d'enrichir des transactions qu'on ecarterait ensuite.
+4. Les transactions sont **remises en ordre chronologique** avant extraction :
    "premier achat par mint" doit designer la plus ancienne entree de la
    fenetre, pas la plus recente.
-4. Un achat est une entree de `tokenTransfers` dont `toUserAccount` est le
+5. Un achat est une entree de `tokenTransfers` dont `toUserAccount` est le
    wallet et dont le mint n'est pas du bruit. Comme en phase 2, une vente
    dans la meme transaction n'annule pas une reception.
-5. Seuls les achats **matures** sont mesurables : plus vieux que
+6. Seuls les achats **matures** sont mesurables : plus vieux que
    `VALIDATION_MIN_TOKEN_AGE_DAYS`. Parmi eux, les **30 plus recents**
    (`VALIDATION_MAX_TOKENS_PER_WALLET`). C'est un echantillon, jamais une
    selection sur la performance : trier par gain biaiserait mecaniquement le
@@ -255,17 +261,17 @@ construction. Le backtest reconstitue son historique d'achats reel.
    (`199 achats, 47 matures, 30 echantillonnes (achats de 11 a 38 j)`).
    Moins de `VALIDATION_MIN_TOKENS` achats matures ->
    `historique_trop_recent`, rendu **sans aucun appel de marche**.
-6. Par mint : pool le plus liquide via `/tokens/{mint}/pools`, puis OHLCV
+7. Par mint : pool le plus liquide via `/tokens/{mint}/pools`, puis OHLCV
    journalier sur 180 jours. `perf = max(high APRES l'achat) / close du jour
    d'achat`, **cappee a `PERF_CAP` avant toute mediane**.
-7. Verdict : `active` si `tokens_evaluated >= VALIDATION_MIN_TOKENS` **et**
+8. Verdict : `active` si `tokens_evaluated >= VALIDATION_MIN_TOKENS` **et**
    `win_rate >= VALIDATION_MIN_WIN_RATE` **et**
    `rug_rate <= VALIDATION_MAX_RUG_RATE`. `validated_at` est ecrit dans tous
    les cas, echec compris — mais jamais en cas de **PERTE**. Trois raisons de
    non-activation sont distinguees : `backtest_echoue`,
    `historique_insuffisant` (assez d'achats matures, mais trop peu
    mesurables) et `historique_trop_recent` (pas assez d'achats matures).
-8. L'ecriture se fait **wallet par wallet, au fil de l'eau** : un arret du
+9. L'ecriture se fait **wallet par wallet, au fil de l'eau** : un arret du
    service ne fait pas rejouer les wallets deja backtestes. Une ligne de
    progression est loguee toutes les 10 wallets.
 
@@ -286,6 +292,40 @@ l'OHLCV est vide ou corrompu, ou un echec reseau. Il est logue a part comme
 Ecarter les tokens a faible liquidite revenait a ne mesurer que les succes.
 Le resume donne, par wallet et au total, le nombre de tokens morts / rugs /
 vivants / non mesurables — sans quoi un win rate ne veut rien dire.
+
+### Pourquoi la pagination
+
+Diagnostic du 18/09 14:21. Amplitude couverte par **500 transactions** :
+
+| Wallet | Couverture | Achats extraits |
+| --- | --- | --- |
+| `7ioEZjdG` | **3 heures** | 202 |
+| `9EX53TQE` | 2,8 jours | 161 |
+| `DXenfCJ4` | **3 heures** | 0 |
+
+Ces wallets font des centaines de transactions par jour. Un appel unique ne
+peut structurellement pas atteindre la fenetre 7-60 j ou se trouvent leurs
+winners : tous rendaient `0 matures`.
+
+La voie A renvoie `result = {"data": [...], "paginationToken": ...}`. La
+boucle redemande la page suivante tant que la derniere transaction de la
+page est plus recente que la profondeur visee, et s'arrete des que l'une de
+ces trois conditions est vraie :
+
+| Motif | Sens |
+| --- | --- |
+| `profondeur_atteinte` | la profondeur visee est couverte |
+| `historique_epuise` | plus de `paginationToken`, tout l'historique est lu |
+| `limite_pages` | **garde-fou atteint**, profondeur NON couverte |
+
+Le troisieme cas est logue en **warning**, pas comme un succes : des achats
+matures manquent peut-etre. Le resume final compte les wallets concernes.
+
+> **Ordre de grandeur a garder en tete** : a 500 tx par page, 20 pages font
+> 10 000 transactions. Pour un wallet a ~4 000 tx/jour comme `7ioEZjdG`,
+> cela ne couvre que **2,5 jours** — la profondeur de 45 j demanderait
+> environ 360 pages. Les wallets hyperactifs finiront donc en
+> `limite_pages`. C'est le warning qui le dira, wallet par wallet.
 
 ### Pourquoi la maturite
 

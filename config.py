@@ -95,6 +95,15 @@ MIN_POOL_LIQUIDITY_USD = 5_000
 # trier sur le gain biaiserait le win rate.
 VALIDATION_MAX_TOKENS_PER_WALLET = 30
 
+# AJUSTABLE - profondeur d'historique visee par la pagination de la voie A.
+# Mesure du 18/09 : 500 transactions couvrent 3 HEURES chez un wallet tres
+# actif. Sans pagination, la fenetre ou se trouvent les winners n'est jamais
+# atteinte.
+VALIDATION_TARGET_AGE_DAYS = 45
+
+# AJUSTABLE - garde-fou : nombre maximum de pages lues par wallet.
+VALIDATION_MAX_PAGES = 20
+
 # AJUSTABLE - age minimum d'un achat pour etre mesurable. En dessous, deux
 # biais se cumulent : le token n'a pas eu le temps de performer, et un
 # lancement pump.fun trop recent n'est pas encore indexe par GeckoTerminal,
@@ -177,8 +186,11 @@ def diagnose_environment() -> bool:
              "activation >= %d winners ou rang <= %d ---",
              EARLY_TX_LIMIT, EARLY_BUYER_MAX_RANK,
              ACTIVATION_MIN_WINNERS, ACTIVATION_TOP_RANK)
-    log.info("--- Validation : %d tx/wallet | >= %d tokens | win rate >= %s | "
-             "rug rate <= %s | cap x%s ---",
-             VALIDATION_TX_LIMIT, VALIDATION_MIN_TOKENS,
+    log.info("--- Validation : %d tx/page, %d pages max, profondeur visee "
+             "%d j | fenetre mesuree %d-%d j | >= %d tokens | win rate >= %s "
+             "| rug rate <= %s | cap x%s ---",
+             VALIDATION_TX_LIMIT, VALIDATION_MAX_PAGES,
+             VALIDATION_TARGET_AGE_DAYS, VALIDATION_MIN_TOKEN_AGE_DAYS,
+             VALIDATION_TARGET_AGE_DAYS, VALIDATION_MIN_TOKENS,
              VALIDATION_MIN_WIN_RATE, VALIDATION_MAX_RUG_RATE, PERF_CAP)
     return has_key

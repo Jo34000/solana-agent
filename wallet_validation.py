@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import math
 import statistics
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
@@ -384,6 +385,102 @@ def _distribution(verdicts: list[dict]) -> None:
             log.info("  %3d-%3d%% : %-3d %s", low, low + 9, count, "#" * count)
 
 
+# ---------------------------------------------------------------------------
+# MODE DIAGNOSTIC (temporaire)
+#
+# Run du 18/09 12:56 : tous les wallets rendent "N achats, 0 matures". Deux
+# hypotheses a departager avant toute correction :
+#   H1 : la voie A limit=500 en ordre descendant ne couvre que les derniers
+#        jours d'activite de ces wallets tres actifs.
+#   H2 : erreur d'unite ou de comparaison sur la date d'achat.
+#
+# Ce bloc n'observe que. Il n'ecrit rien en base et s'arrete apres
+# DIAGNOSTIC_WALLETS wallets, pour ne pas consommer le quota.
+# ---------------------------------------------------------------------------
+
+DIAGNOSTIC_WALLETS = 3
+
+
+def _both_units(value: Any) -> str:
+    """Rend la valeur lue en SECONDES et en MILLISECONDES.
+
+    C'est la lecture qui tranche H2 : si l'interpretation en secondes donne
+    1970 et celle en millisecondes une date plausible, l'unite est en cause.
+    """
+    if not isinstance(value, (int, float)):
+        return f"{value!r} ({type(value).__name__}) - non numerique"
+    parts = []
+    for label, divisor in (("s", 1), ("ms", 1000)):
+        try:
+            moment = datetime.fromtimestamp(value / divisor, tz=timezone.utc)
+            parts.append(f"lu en {label} -> {moment.isoformat()}")
+        except (OverflowError, OSError, ValueError):
+            parts.append(f"lu en {label} -> hors plage")
+    return f"{value!r} ({type(value).__name__}) | " + " | ".join(parts)
+
+
+def diagnose_wallet(wallet: str) -> None:
+    """Trace les dates d'un wallet, de la voie A jusqu'au calcul d'age."""
+    log.info("--- DIAGNOSTIC %s ---", wallet)
+
+    detailed = helius.transactions_for_address_detailed(
+        wallet, VALIDATION_TX_LIMIT, sort_order="desc"
+    )
+    if detailed is None:
+        log.warning("  voie A perdue, rien a tracer")
+        return
+    transactions, result = detailed
+
+    log.info("  voie A : %d transactions renvoyees (limit demandee %d)",
+             len(transactions), VALIDATION_TX_LIMIT)
+    log.info("  voie A : cles de result = %s", sorted(result.keys()))
+    if transactions:
+        first, last = transactions[0], transactions[-1]
+        log.info("  voie A PREMIERE tx : blockTime %s",
+                 _both_units(first.get("blockTime")))
+        log.info("  voie A DERNIERE  tx : blockTime %s",
+                 _both_units(last.get("blockTime")))
+
+    usable = [
+        item for item in transactions
+        if isinstance(item, dict) and item.get("err") is None
+        and isinstance(item.get("signature"), str)
+    ]
+    enriched = helius.enrich_signatures([item["signature"] for item in usable])
+    if enriched is None:
+        log.warning("  voie C perdue, rien a tracer")
+        return
+
+    chronological = sorted(enriched, key=lambda t: _to_float(t.get("timestamp")))
+    purchases = extract_purchases(chronological, wallet)
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+    cutoff = now_ts - VALIDATION_MIN_TOKEN_AGE_DAYS * 86400
+    log.info("  maintenant        : %s", _both_units(now_ts))
+    log.info("  limite maturite   : %s", _both_units(cutoff))
+    log.info("  (un achat est mature si bought_at <= limite, soit un age "
+             ">= %d j)", VALIDATION_MIN_TOKEN_AGE_DAYS)
+
+    log.info("  %d achats extraits", len(purchases))
+    for index, purchase in enumerate(list(purchases.values())[:3], start=1):
+        raw = purchase["bought_at"]
+        age_days = (now_ts - raw) / 86400
+        log.info("  achat %d : mint %s", index, purchase["mint"])
+        log.info("    bought_at (champ 'timestamp' de la voie C) : %s",
+                 _both_units(raw))
+        log.info("    age calcule par le code : %.2f j -> mature : %s",
+                 age_days, "oui" if raw <= cutoff else "NON")
+
+    # La ligne qui tranche H1 : si le plus ancien achat atteignable a moins
+    # de VALIDATION_MIN_TOKEN_AGE_DAYS, la fenetre de collecte est en cause.
+    if purchases:
+        ages = [(now_ts - p["bought_at"]) / 86400 for p in purchases.values()]
+        log.info(
+            "  amplitude des %d achats : du plus ancien %.2f j au plus "
+            "recent %.2f j", len(ages), max(ages), min(ages),
+        )
+
+
 def run() -> int:
     setup_logging()
     diagnose_environment()
@@ -404,6 +501,26 @@ def run() -> int:
         len(candidates) * VALIDATION_MAX_TOKENS_PER_WALLET,
         2 * gt.MIN_REQUEST_INTERVAL_S,
     )
+
+    log.warning(
+        "MODE DIAGNOSTIC : %d wallets traces, AUCUNE ecriture en base, arret "
+        "immediat ensuite. Aucun verdict ne sera produit.",
+        DIAGNOSTIC_WALLETS,
+    )
+    traced = 0
+    for candidate in candidates:
+        wallet = candidate.get("wallet")
+        if not isinstance(wallet, str) or not wallet:
+            continue
+        diagnose_wallet(wallet)
+        traced += 1
+        if traced >= DIAGNOSTIC_WALLETS:
+            break
+    log.warning(
+        "MODE DIAGNOSTIC : %d wallets traces, arret. Rien n'a ete ecrit.",
+        traced,
+    )
+    sys.exit(0)
 
     verdicts: list[dict] = []
     bots = 0

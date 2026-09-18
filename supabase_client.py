@@ -20,6 +20,27 @@ Colonnes attendues cote Supabase :
     is_winner       boolean
     rejected_reason text
     analyzed_at     timestamptz
+    buyers_extracted_at timestamptz  (phase 2 : NULL = a traiter)
+
+Colonnes attendues sur sol_early_buys :
+    mint         text     \ contrainte unique (mint, wallet)
+    wallet       text     /
+    buy_rank     integer  (1, 2, 3... par ordre d'apparition)
+    is_bundle    boolean  (transaction dans le slot de lancement)
+    sol_amount   numeric  (NULL si non determinable)
+    signature    text
+    slot         bigint
+    block_time   timestamptz
+    extracted_at timestamptz
+
+Colonnes attendues sur sol_smart_wallets :
+    wallet            text  (cle primaire / unique)
+    winners_count     integer
+    winner_tokens     jsonb ou text[]
+    best_rank         integer
+    active            boolean
+    activation_reason text
+    updated_at        timestamptz
 """
 
 from __future__ import annotations
@@ -30,7 +51,7 @@ from datetime import datetime, timedelta, timezone
 
 from supabase import Client, create_client
 
-from config import ANALYZED_TABLE
+from config import ANALYZED_TABLE, EARLY_BUYS_TABLE, SMART_WALLETS_TABLE
 
 log = logging.getLogger("solana-agent")
 
@@ -126,3 +147,122 @@ def fetch_winners(limit: int = 500) -> list[dict]:
     rows = response.data or []
     log.info("Supabase : %d winners en base", len(rows))
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 : early buyers
+# ---------------------------------------------------------------------------
+
+
+def fetch_winners_to_process(limit: int = 1000) -> list[dict]:
+    """Winners dont les acheteurs n'ont pas encore ete extraits."""
+    response = (
+        get_client()
+        .table(ANALYZED_TABLE)
+        .select("mint, symbol, peak_at")
+        .eq("is_winner", True)
+        .is_("buyers_extracted_at", "null")
+        .limit(limit)
+        .execute()
+    )
+    rows = response.data or []
+    log.info("Supabase : %d winners a traiter", len(rows))
+    return rows
+
+
+def insert_early_buys(rows: list[dict]) -> int:
+    """Premier achat par (mint, wallet). Un rang existant n'est PAS ecrase.
+
+    ignore_duplicates : les lignes deja presentes sont ignorees cote base,
+    donc moins de lignes confirmees que de lignes envoyees est NORMAL ici
+    et ne doit pas lever.
+    """
+    if not rows:
+        log.info("Supabase : aucun early buy a ecrire")
+        return 0
+
+    response = (
+        get_client()
+        .table(EARLY_BUYS_TABLE)
+        .upsert(rows, on_conflict="mint,wallet", ignore_duplicates=True)
+        .execute()
+    )
+    written = len(response.data or [])
+    log.info(
+        "Supabase : %d nouvelles lignes dans %s (%d envoyees, le reste deja "
+        "connu)", written, EARLY_BUYS_TABLE, len(rows),
+    )
+    return written
+
+
+def mark_buyers_extracted(mint: str) -> None:
+    """Marque un token comme traite. A n'appeler qu'en l'absence de PERTE."""
+    now = datetime.now(timezone.utc).isoformat()
+    (
+        get_client()
+        .table(ANALYZED_TABLE)
+        .update({"buyers_extracted_at": now})
+        .eq("mint", mint)
+        .execute()
+    )
+
+
+def fetch_early_buys(max_rank: int) -> list[dict]:
+    """Tous les achats early hors bundle, tous runs confondus.
+
+    C'est cette lecture globale qui fait l'accumulation : un wallet vu sur
+    un winner cette semaine et sur un autre la semaine prochaine voit son
+    winners_count monter.
+    """
+    rows: list[dict] = []
+    offset = 0
+    while True:
+        response = (
+            get_client()
+            .table(EARLY_BUYS_TABLE)
+            .select("mint, wallet, buy_rank")
+            .eq("is_bundle", False)
+            .lte("buy_rank", max_rank)
+            .range(offset, offset + _PAGE_SIZE - 1)
+            .execute()
+        )
+        page = response.data or []
+        rows.extend(page)
+        if len(page) < _PAGE_SIZE:
+            break
+        offset += _PAGE_SIZE
+
+    log.info(
+        "Supabase : %d achats early (hors bundle, rang <= %d) en base",
+        len(rows), max_rank,
+    )
+    return rows
+
+
+def upsert_smart_wallets(rows: list[dict]) -> int:
+    """Remplace l'etat de chaque wallet. Leve si l'ecriture est partielle."""
+    if not rows:
+        log.info("Supabase : aucun wallet a ecrire")
+        return 0
+
+    written = 0
+    for start in range(0, len(rows), _PAGE_SIZE):
+        batch = rows[start:start + _PAGE_SIZE]
+        response = (
+            get_client()
+            .table(SMART_WALLETS_TABLE)
+            .upsert(batch, on_conflict="wallet")
+            .execute()
+        )
+        written += len(response.data or [])
+
+    log.info(
+        "Supabase : %d/%d wallets upsertes dans %s",
+        written, len(rows), SMART_WALLETS_TABLE,
+    )
+    if written < len(rows):
+        raise RuntimeError(
+            f"Ecriture partielle dans {SMART_WALLETS_TABLE} : {written} "
+            f"confirmees sur {len(rows)} envoyees (verifier les policies RLS)."
+        )
+    return written

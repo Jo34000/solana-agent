@@ -3,9 +3,12 @@
 Detection de wallets Solana performants, puis alerte Telegram quand plusieurs
 d'entre eux achetent le meme token a faible capitalisation.
 
-Ce repo est construit par briques. **Phase 1 (seule livree a ce jour)** :
-trouver les tokens Solana "winners" (x5 ou plus depuis leur lancement) qui
-serviront ensuite a identifier les wallets.
+Ce repo est construit par briques.
+
+- **Phase 1** : trouver les tokens Solana "winners" (x5 ou plus depuis leur
+  lancement) — `RUN_MODE=winners`.
+- **Phase 2** : retrouver leurs premiers acheteurs et accumuler les wallets
+  candidats — `RUN_MODE=discovery`.
 
 ## Fichiers
 
@@ -13,9 +16,11 @@ serviront ensuite a identifier les wallets.
 | --- | --- |
 | `config.py` | Seuils AJUSTABLES + diagnostic des variables d'environnement |
 | `geckoterminal.py` | Client HTTP CoinGecko onchain (rate limit, retry, pertes explicites) |
-| `supabase_client.py` | Lecture / upsert sur `sol_analyzed_tokens` |
+| `supabase_client.py` | Lecture / upsert sur les tables `sol_*` |
 | `main.py` | Point d'entree, dispatch via `RUN_MODE` |
-| `find_winners.py` | Pipeline de discovery |
+| `find_winners.py` | Phase 1 : pipeline de discovery des winners |
+| `helius.py` | Client HTTP Helius (throttle dedie, retry, pertes explicites) |
+| `wallet_discovery.py` | Phase 2 : extraction des early buyers |
 | `probe_sort.py` | Sonde jetable : le tri de `/pools` est-il applique ? |
 | `probe_helius.py` | Sonde jetable : forme des reponses Helius (phase 2) |
 
@@ -28,15 +33,15 @@ pip install -r requirements.txt
 
 ## Variables d'environnement
 
-Aucun secret n'est versionne. Trois variables sont lues via `os.environ` :
+Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `winners` (defaut) ou `probe` — voir Execution |
+| `RUN_MODE` | `winners` (defaut), `discovery`, `probe`, `probe_helius` — voir Execution |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
-| `HELIUS_API_KEY` | Cle Helius — requise par `RUN_MODE=probe_helius` uniquement |
+| `HELIUS_API_KEY` | Cle Helius — requise par `discovery` et `probe_helius` |
 | `SUPABASE_URL` | URL du projet Supabase |
-| `SUPABASE_KEY` | Cle Supabase avec droit d'ecriture sur `sol_analyzed_tokens` |
+| `SUPABASE_KEY` | Cle Supabase avec droit d'ecriture sur les tables `sol_*` |
 
 En local, un fichier `.env` (git-ignore) suffit. Au demarrage, chaque variable
 est loguee `presente` ou `ABSENTE`, et la source est annoncee explicitement :
@@ -48,14 +53,16 @@ bascule silencieuse en mode degrade.
 Point d'entree unique : `main.py`, qui lit `RUN_MODE`.
 
 ```bash
-RUN_MODE=winners python main.py   # defaut : pipeline de discovery
-RUN_MODE=probe   python main.py   # sonde de tri (CoinGecko)
-RUN_MODE=probe_helius python main.py   # sonde Helius (phase 2)
+RUN_MODE=winners   python main.py   # defaut : phase 1, tokens winners
+RUN_MODE=discovery python main.py   # phase 2, early buyers
+RUN_MODE=probe     python main.py   # sonde de tri (CoinGecko)
+RUN_MODE=probe_helius python main.py # sonde Helius
 ```
 
 | `RUN_MODE` | Effet |
 | --- | --- |
-| `winners` (defaut, valeur vide incluse) | pipeline de discovery |
+| `winners` (defaut, valeur vide incluse) | phase 1 : tokens winners |
+| `discovery` | phase 2 : early buyers des winners |
 | `probe` | sonde de tri CoinGecko, le pipeline n'est pas lance |
 | `probe_helius` | sonde Helius, le pipeline n'est pas lance |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
@@ -157,6 +164,65 @@ approchant : un repli substituerait silencieusement un autre DEX a celui
 qu'on veut mesurer. Si l'appel echoue, la collecte par DEX est desactivee
 pour le run et les autres sources continuent.
 
+## Phase 2 : extraction des early buyers
+
+`RUN_MODE=discovery`. Deux voies Helius, arretees apres la sonde du 18/09 :
+
+| Voie | Role |
+| --- | --- |
+| A — `getTransactionsForAddress` (JSON-RPC) | les signatures, en ordre **ascendant** |
+| C — `POST /v0/transactions` | l'enrichissement, par lots de 100 |
+
+La voie A est la seule a remonter les transactions les plus anciennes d'une
+adresse ; elle ne rend que des metadonnees (`signature`, `slot`, `err`...).
+La voie C ajoute `tokenTransfers` et `nativeTransfers`. `meta` et
+`transaction` bruts ne sont pas parses.
+
+### Ce que fait un run
+
+1. Selection : `sol_analyzed_tokens WHERE is_winner AND
+   buyers_extracted_at IS NULL`.
+2. Par mint : voie A sur `EARLY_TX_LIMIT` transactions, filtre `err == null`,
+   puis voie C sur les signatures retenues.
+3. **Slot de lancement** = slot de la toute premiere transaction du lot
+   brut, avant le filtre `err` — une transaction echouee marque quand meme
+   le bundle. Toute transaction a ce slot porte `is_bundle = true`.
+4. Un achat est une entree de `tokenTransfers` dont le `mint` est la cible
+   **et** dont `toUserAccount` est le `feePayer`. L'inverse est une vente,
+   ignoree. Le montant en SOL est la somme des `nativeTransfers` partant du
+   `feePayer`, en lamports / 1e9, `NULL` si absent.
+5. `buy_rank` incremental par ordre d'apparition, un wallet ne comptant
+   qu'une fois. Les transactions enrichies sont **reordonnees sur l'ordre
+   ascendant de la voie A** : la voie C ne garantit pas de conserver
+   l'ordre des signatures envoyees, et le rang en depend entierement.
+6. Ecriture dans `sol_early_buys` en `ON CONFLICT DO NOTHING` sur
+   `(mint, wallet)` : le premier achat seulement, un rang existant n'est
+   jamais ecrase.
+7. `buyers_extracted_at` est pose **meme a zero acheteur**, sinon le token
+   serait rejoue a chaque run. Jamais en cas de **PERTE** en revanche : le
+   token reste a traiter.
+
+### Accumulation
+
+`sol_smart_wallets` est recalcule depuis la **totalite** de
+`sol_early_buys` (hors `is_bundle`, rang <= `EARLY_BUYER_MAX_RANK`), pas
+depuis le seul run. Un wallet vu sur un winner cette semaine et sur un autre
+la semaine prochaine voit son `winners_count` monter.
+
+| Champ | Regle |
+| --- | --- |
+| `winners_count` | mints distincts |
+| `best_rank` | rang minimum |
+| `active` | `winners_count >= ACTIVATION_MIN_WINNERS` **ou** `best_rank <= ACTIVATION_TOP_RANK` |
+| `activation_reason` | `recoupement`, `rang_bas`, ou `NULL` |
+
+**Tous** les wallets sont enregistres, actifs ou non : c'est l'accumulation
+inter-runs qui les fait basculer.
+
+Dans la ligne de resume, `acheteurs bruts` et `hors bundle` portent sur le
+run ; `wallets distincts` et `actifs` sont les totaux accumules, puisqu'ils
+viennent du recalcul global.
+
 ## La sonde `RUN_MODE=probe`
 
 `probe_sort.py` repond a une seule question : le parametre de tri de
@@ -220,3 +286,12 @@ exactement ce qui avait produit le faux negatif.
 pas. La cle n'apparait jamais dans les logs, URL et corps de requete sont
 masques. Le throttle Helius (0,5 s) est **dedie** et independant de celui
 de CoinGecko : free tier a 10 req/s, la sonde fait une dizaine d'appels.
+
+## Volume de winners
+
+La base **s'alimente par accumulation** : chaque run n'analyse que les mints
+absents de `sol_analyzed_tokens` depuis moins de `ANALYZED_TTL_DAYS`, si bien
+que des runs hebdomadaires empilent des winners nouveaux au lieu de
+re-mesurer les memes. Le compte d'un run isole n'est donc pas un objectif a
+atteindre : le run logue `winners ce run : N` a titre informatif, sans
+avertissement. Le meme principe vaut en phase 2 pour `sol_smart_wallets`.

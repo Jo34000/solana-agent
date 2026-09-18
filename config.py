@@ -46,6 +46,21 @@ WINNER_MULTIPLE = 5.0
 # n'est pas re-analyse.
 ANALYZED_TTL_DAYS = 60
 
+# --- Phase 2 : extraction des early buyers -------------------------------
+
+# AJUSTABLE - transactions remontees par mint (voie A, ordre ascendant).
+EARLY_TX_LIMIT = 200
+
+# AJUSTABLE - rang maximum pour qu'un achat compte comme "early".
+EARLY_BUYER_MAX_RANK = 50
+
+# AJUSTABLE - nombre de winners distincts a partir duquel un wallet est
+# active par recoupement.
+ACTIVATION_MIN_WINNERS = 2
+
+# AJUSTABLE - rang a partir duquel un wallet est active sur un seul winner.
+ACTIVATION_TOP_RANK = 20
+
 # --------------------------------------------------------------------------
 # Constantes techniques (non ajustables a la volee)
 # --------------------------------------------------------------------------
@@ -59,8 +74,15 @@ MIN_REQUEST_INTERVAL_S = 2.1
 MAX_RETRIES = 3
 
 ANALYZED_TABLE = "sol_analyzed_tokens"
+EARLY_BUYS_TABLE = "sol_early_buys"
+SMART_WALLETS_TABLE = "sol_smart_wallets"
 
-ENV_VARS = ("COINGECKO_API_KEY", "SUPABASE_URL", "SUPABASE_KEY")
+ENV_VARS = (
+    "COINGECKO_API_KEY",
+    "HELIUS_API_KEY",
+    "SUPABASE_URL",
+    "SUPABASE_KEY",
+)
 
 log = logging.getLogger("solana-agent")
 
@@ -107,4 +129,8 @@ def diagnose_environment() -> bool:
              MIN_POOL_AGE_DAYS, MAX_POOL_AGE_DAYS,
              f"{MIN_LIQUIDITY_USD:,}", f"{MIN_VOLUME_24H_USD:,}",
              WINNER_MULTIPLE, ANALYZED_TTL_DAYS)
+    log.info("--- Early buyers : %d tx/mint | early <= rang %d | "
+             "activation >= %d winners ou rang <= %d ---",
+             EARLY_TX_LIMIT, EARLY_BUYER_MAX_RANK,
+             ACTIVATION_MIN_WINNERS, ACTIVATION_TOP_RANK)
     return has_key

@@ -3,9 +3,10 @@
 Railway n'expose qu'une seule Start Command : le mode est donc choisi par la
 variable d'environnement RUN_MODE.
 
-    RUN_MODE=winners      (defaut) -> pipeline de discovery
+    RUN_MODE=winners      (defaut) -> phase 1 : discovery des tokens winners
+    RUN_MODE=discovery             -> phase 2 : early buyers des winners
     RUN_MODE=probe                 -> sonde de tri (CoinGecko)
-    RUN_MODE=probe_helius          -> sonde Helius (phase 2)
+    RUN_MODE=probe_helius          -> sonde Helius
 
 Start Command Railway : python main.py
 """
@@ -20,7 +21,7 @@ from config import setup_logging
 
 log = logging.getLogger("solana-agent")
 
-RUN_MODES = ("winners", "probe", "probe_helius")
+RUN_MODES = ("winners", "discovery", "probe", "probe_helius")
 
 
 def resolve_run_mode() -> str:
@@ -38,6 +39,12 @@ def main() -> int:
     setup_logging()
     mode = resolve_run_mode()
     log.info("RUN_MODE=%s", mode)
+
+    if mode == "discovery":
+        import wallet_discovery
+
+        wallet_discovery.run()
+        return 0
 
     if mode == "probe_helius":
         import probe_helius

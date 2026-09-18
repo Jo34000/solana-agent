@@ -85,8 +85,15 @@ VALIDATION_MAX_TX = 50_000
 # isole ne doit pas porter le verdict d'un wallet.
 PERF_CAP = 20.0
 
-# AJUSTABLE - sous cette liquidite, le pool n'est pas jugé mesurable.
+# AJUSTABLE - sous cette liquidite, le token est considere comme rugge. Il
+# est COMPTE dans le backtest, jamais ecarte : c'est la perte qu'on cherche
+# precisement a mesurer.
 MIN_POOL_LIQUIDITY_USD = 5_000
+
+# AJUSTABLE - echantillon de tokens mesures par wallet. Ce sont les plus
+# RECENTS qui sont gardes, jamais les plus performants : trier sur le gain
+# biaiserait le win rate.
+VALIDATION_MAX_TOKENS_PER_WALLET = 30
 
 # --------------------------------------------------------------------------
 # Constantes techniques (non ajustables a la volee)

@@ -247,13 +247,40 @@ construction. Le backtest reconstitue son historique d'achats reel.
 4. Un achat est une entree de `tokenTransfers` dont `toUserAccount` est le
    wallet et dont le mint n'est pas du bruit. Comme en phase 2, une vente
    dans la meme transaction n'annule pas une reception.
-5. Par mint : pool le plus liquide via `/tokens/{mint}/pools`, puis OHLCV
+5. Sur les achats extraits, seuls les **30 plus recents**
+   (`VALIDATION_MAX_TOKENS_PER_WALLET`) sont mesures. C'est un echantillon,
+   jamais une selection sur la performance : trier par gain biaiserait
+   mecaniquement le win rate. La troncature est loguee
+   (`201 achats, 30 echantillonnes`).
+6. Par mint : pool le plus liquide via `/tokens/{mint}/pools`, puis OHLCV
    journalier sur 180 jours. `perf = max(high APRES l'achat) / close du jour
    d'achat`, **cappee a `PERF_CAP` avant toute mediane**.
-6. Verdict : `active` si `tokens_evaluated >= VALIDATION_MIN_TOKENS` **et**
+7. Verdict : `active` si `tokens_evaluated >= VALIDATION_MIN_TOKENS` **et**
    `win_rate >= VALIDATION_MIN_WIN_RATE` **et**
    `rug_rate <= VALIDATION_MAX_RUG_RATE`. `validated_at` est ecrit dans tous
    les cas, echec compris — mais jamais en cas de **PERTE**.
+8. L'ecriture se fait **wallet par wallet, au fil de l'eau** : un arret du
+   service ne fait pas rejouer les wallets deja backtestes. Une ligne de
+   progression est loguee toutes les 10 wallets.
+
+### Les pertes sont comptees
+
+Un token achete est classe dans cet ordre :
+
+| Etat | Condition | Compte ? | Cout |
+| --- | --- | --- | --- |
+| **mort** | aucun pool trouve | oui, `perf = 0`, `rug` | 1 appel |
+| **rug** | pool sous `MIN_POOL_LIQUIDITY_USD`, ou volume 24h nul | oui, `rug` ; OHLCV tente pour mesurer la perf atteinte avant la chute, `perf = 0` si indisponible | 2 appels |
+| **vivant** | pool au-dessus du seuil | oui, perf mesuree normalement | 2 appels |
+
+Le **seul** cas ou un token sort du decompte : un token *vivant* dont
+l'OHLCV est vide ou corrompu, ou un echec reseau. Il est logue a part comme
+`non mesurable`, distinct des rugs.
+
+C'est le correctif central de cette version : ecarter les tokens a faible
+liquidite revenait a ne mesurer que les succes. Le resume donne, par wallet
+et au total, le nombre de tokens morts / rugs / vivants / non mesurables —
+sans quoi un win rate ne veut rien dire.
 
 ### Pas de plancher d'activite
 
@@ -269,22 +296,15 @@ compteur `exclus bot` du resume restera a zero.
 ### Cache et cout
 
 Les donnees de marche sont mises en cache **par mint pour la duree du run** :
-plusieurs wallets achetent les memes tokens, et chaque mint coute deux appels
-CoinGecko. Le cache retient aussi les mints inmesurables, mais **jamais une
-PERTE** — celle-ci doit pouvoir etre reessayee.
+plusieurs wallets achetent les memes tokens, et chaque mint coute un a deux
+appels CoinGecko. Le cache retient les trois etats, tokens morts compris,
+mais **jamais une PERTE** — celle-ci doit pouvoir etre reessayee.
 
 Le budget Helius est affiche au demarrage. La part CoinGecko depend du nombre
 de mints distincts, inconnu a priori, et domine le temps de run : 2 appels a
 2,1 s par mint.
 
-### Deux limites connues
-
-**Les tokens a faible liquidite sont ignores, pas comptes comme rugs.** Un
-pool sous `MIN_POOL_LIQUIDITY_USD` sort du calcul et ne compte pas dans
-`tokens_evaluated`. La clause "liquidite actuelle < seuil" de la definition
-d'un rug en devient inatteignable : seul un volume 24h nul peut declencher
-`is_rug`. Les tokens qui ont rugge le plus franchement sont donc les plus
-susceptibles d'etre ecartes du backtest.
+### Limite connue
 
 **`active` et `activation_reason` sont partages avec la phase 2.** Un run
 `discovery` posterieur recalcule ces deux colonnes depuis le recoupement et

@@ -30,6 +30,7 @@ from config import (
     MIN_POOL_LIQUIDITY_USD,
     PERF_CAP,
     VALIDATION_MAX_RUG_RATE,
+    VALIDATION_MAX_TOKENS_PER_WALLET,
     VALIDATION_MAX_TX,
     VALIDATION_MIN_TOKENS,
     VALIDATION_MIN_WIN_RATE,
@@ -129,10 +130,15 @@ def _most_liquid_pool(pools: list[dict]) -> dict | None:
 
 
 def fetch_token_data(mint: str) -> dict | None:
-    """Pool le plus liquide + bougies. None = mint non mesurable.
+    """Etat de marche d'un mint. None = PERTE reseau (non memorisee).
 
-    Mis en cache pour la duree du run : plusieurs wallets achetent les
-    memes tokens, et chaque mint coute deux appels GeckoTerminal.
+    Trois etats, testes dans cet ordre :
+      mort   : aucun pool. Aucun appel OHLCV, un seul appel au lieu de deux.
+      rug    : pool sous MIN_POOL_LIQUIDITY_USD. L'OHLCV est quand meme
+               tente, pour mesurer la perf atteinte avant la chute.
+      vivant : pool au-dessus du seuil.
+
+    Les trois sont mis en cache pour la duree du run, tokens morts compris.
     """
     if mint in _token_cache:
         return _token_cache[mint]
@@ -144,16 +150,17 @@ def fetch_token_data(mint: str) -> dict | None:
 
     pool = _most_liquid_pool(pools) if pools else None
     if pool is None:
-        _token_cache[mint] = None
-        return None
+        # Aucun pool : le token est mort. C'est une perte seche, elle doit
+        # compter dans le backtest.
+        data = {"mint": mint, "status": "mort", "candles": None, "is_rug": True}
+        _token_cache[mint] = data
+        return data
 
     attributes = pool.get("attributes") or {}
     liquidity = _to_float(attributes.get("reserve_in_usd"))
-    if liquidity < MIN_POOL_LIQUIDITY_USD:
-        # Pool trop mince pour que l'OHLCV soit exploitable : le token est
-        # ignore et ne comptera pas dans tokens_evaluated.
-        _token_cache[mint] = None
-        return None
+    volume_24h = _to_float((attributes.get("volume_usd") or {}).get("h24"))
+    is_rug = liquidity < MIN_POOL_LIQUIDITY_USD or volume_24h <= 0
+    status = "rug" if is_rug else "vivant"
 
     pool_address = attributes.get("address") or pool.get("id", "").split("_", 1)[-1]
     candles = gt.ohlcv_day(pool_address, limit=OHLCV_DAYS)
@@ -164,20 +171,14 @@ def fetch_token_data(mint: str) -> dict | None:
         (c for c in candles if isinstance(c, (list, tuple)) and len(c) >= 5),
         key=lambda c: _to_float(c[0]),
     )
-    if len(ordered) < 2:
-        _token_cache[mint] = None
-        return None
-
-    volume_24h = _to_float((attributes.get("volume_usd") or {}).get("h24"))
     data = {
         "mint": mint,
+        "status": status,
         "pool_address": pool_address,
         "liquidity_usd": liquidity,
         "volume_24h_usd": volume_24h,
-        "candles": ordered,
-        # La liquidite est deja >= MIN_POOL_LIQUIDITY_USD a ce stade : seul
-        # un volume 24h nul peut encore signaler un token mort.
-        "is_rug": liquidity < MIN_POOL_LIQUIDITY_USD or volume_24h <= 0,
+        "candles": ordered if len(ordered) >= 2 else None,
+        "is_rug": is_rug,
     }
     _token_cache[mint] = data
     return data
@@ -185,7 +186,10 @@ def fetch_token_data(mint: str) -> dict | None:
 
 def performance_since(data: dict, bought_at: float) -> float | None:
     """max(high APRES l'achat) / prix a l'achat, cappe. None si non mesurable."""
-    candles = data["candles"]
+    candles = data.get("candles")
+    if not candles:
+        return None
+
     entry_index = None
     for index, candle in enumerate(candles):
         if _to_float(candle[0]) <= bought_at:
@@ -207,6 +211,25 @@ def performance_since(data: dict, bought_at: float) -> float | None:
     if peak <= 0:
         return None
     return min(peak / entry_price, PERF_CAP)
+
+
+def evaluate_purchase(data: dict, bought_at: float) -> tuple[float | None, str]:
+    """(performance, issue). perf None = token non mesurable, non compte.
+
+    Un token mort ou rugge est TOUJOURS compte, a perf 0 si son historique
+    de prix est indisponible : c'est la perte qu'on cherche a mesurer. Seul
+    un token VIVANT dont l'OHLCV est inexploitable sort du decompte.
+    """
+    if data["status"] == "mort":
+        return 0.0, "mort"
+
+    perf = performance_since(data, bought_at)
+    if data["status"] == "rug":
+        return (perf if perf is not None else 0.0), "rug"
+
+    if perf is None:
+        return None, "non_mesurable"
+    return perf, "vivant"
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +293,10 @@ def validate_wallet(wallet: str) -> dict | None:
         and isinstance(item.get("signature"), str)
     ]
     if not usable:
-        return build_verdict(wallet, [], 0)
+        verdict = build_verdict(wallet, [], 0)
+        verdict["_counts"] = Counter()
+        verdict["_bought"] = 0
+        return verdict
 
     enriched = helius.enrich_signatures([item["signature"] for item in usable])
     if enriched is None:
@@ -279,27 +305,35 @@ def validate_wallet(wallet: str) -> dict | None:
     # La voie A est interrogee en ordre DESCENDANT (historique recent) : on
     # remet les transactions en ordre chronologique pour que "premier achat"
     # designe bien la plus ancienne entree de la fenetre.
-    chronological = sorted(
-        enriched,
-        key=lambda t: _to_float(t.get("timestamp")),
-    )
+    chronological = sorted(enriched, key=lambda t: _to_float(t.get("timestamp")))
     purchases = extract_purchases(chronological, wallet)
+
+    # Echantillon des plus RECENTS. Jamais un tri sur la performance : cela
+    # biaiserait mecaniquement le win rate.
+    sample = sorted(
+        purchases.values(), key=lambda p: p["bought_at"], reverse=True
+    )[:VALIDATION_MAX_TOKENS_PER_WALLET]
 
     perfs: list[float] = []
     rugs = 0
-    for purchase in purchases.values():
+    counts: Counter = Counter()
+    for purchase in sample:
         data = fetch_token_data(purchase["mint"])
-        if data is None:  # non mesurable : ne compte pas
+        if data is None:  # PERTE reseau sur ce mint, deja loguee
+            counts["non_mesurable"] += 1
             continue
-        perf = performance_since(data, purchase["bought_at"])
-        if perf is None:  # OHLCV inexploitable pour cette date
+        perf, outcome = evaluate_purchase(data, purchase["bought_at"])
+        counts[outcome] += 1
+        if perf is None:
             continue
         perfs.append(perf)
-        if data["is_rug"]:
+        if outcome in ("mort", "rug"):
             rugs += 1
 
     verdict = build_verdict(wallet, perfs, rugs)
     verdict["_bought"] = len(purchases)
+    verdict["_sampled"] = len(sample)
+    verdict["_counts"] = counts
     return verdict
 
 
@@ -336,19 +370,21 @@ def run() -> int:
 
     per_wallet = 1 + math.ceil(VALIDATION_TX_LIMIT / helius.ENRICH_BATCH_SIZE)
     log.info(
-        "Budget : %d wallets x %d appels Helius = %d (~%.1f min), plus 2 "
-        "appels CoinGecko par mint distinct (~%.0f s chacun)",
+        "Budget : %d wallets x %d appels Helius = %d (~%.1f min). CoinGecko : "
+        "au plus %d tokens echantillonnes, 1 a 2 appels par mint distinct "
+        "(~%.1f s), le cache absorbant les doublons",
         len(candidates), per_wallet, len(candidates) * per_wallet,
         len(candidates) * per_wallet * helius.MIN_REQUEST_INTERVAL_S / 60,
+        len(candidates) * VALIDATION_MAX_TOKENS_PER_WALLET,
         2 * gt.MIN_REQUEST_INTERVAL_S,
     )
 
     verdicts: list[dict] = []
     bots = 0
     lost: list[str] = []
-    no_total = 0
+    totals: Counter = Counter()
 
-    for candidate in candidates:
+    for index, candidate in enumerate(candidates, start=1):
         wallet = candidate.get("wallet")
         if not isinstance(wallet, str) or not wallet:
             continue
@@ -363,23 +399,45 @@ def run() -> int:
             continue
 
         bought = verdict.pop("_bought", 0)
-        if verdict["tokens_evaluated"] == 0 and bought == 0:
-            no_total += 1
+        sampled = verdict.pop("_sampled", 0)
+        counts = verdict.pop("_counts", Counter())
+        totals.update(counts)
+
+        sampling = (
+            f"{bought} achats, {sampled} echantillonnes"
+            if sampled < bought else f"{bought} achats"
+        )
         log.info(
-            "%s... : %d achats | %d mesures | win %s | mediane %s | rug %s | %s",
-            wallet[:8], bought, verdict["tokens_evaluated"],
+            "%s... : %s | %d mesures (morts %d / rugs %d / vivants %d, "
+            "non mesurables %d) | win %s | mediane %s | rug %s | %s",
+            wallet[:8], sampling, verdict["tokens_evaluated"],
+            counts["mort"], counts["rug"], counts["vivant"],
+            counts["non_mesurable"],
             verdict["win_rate"], verdict["median_perf"], verdict["rug_rate"],
             verdict["activation_reason"],
         )
         verdicts.append(verdict)
+
+        # Ecriture au fil de l'eau : un arret du service ne doit pas faire
+        # rejouer les wallets deja backtestes.
+        db.update_wallet_validation([verdict])
+
+        if index % 10 == 0:
+            valid_so_far = sum(
+                1 for v in verdicts if v["activation_reason"] == "backtest_valide"
+            )
+            log.info(
+                "wallet %d/%d | valides %d | cache %d mints | appels "
+                "CoinGecko %d",
+                index, len(candidates), valid_so_far, len(_token_cache),
+                gt.request_stats()[0],
+            )
 
     if lost:
         log.warning(
             "PERTE : %d wallet(s) non backtestes, sans validated_at, rejoues "
             "au prochain run", len(lost),
         )
-
-    db.update_wallet_validation(verdicts)
 
     valid = [v for v in verdicts if v["activation_reason"] == "backtest_valide"]
     thin = [v for v in verdicts if v["activation_reason"] == "historique_insuffisant"]
@@ -391,6 +449,10 @@ def run() -> int:
         "candidats %d | backtestes %d | valides %d | historique insuffisant "
         "%d | exclus bot %d",
         len(candidates), len(verdicts), len(valid), len(thin), bots,
+    )
+    log.info(
+        "tokens : morts %d | rugs %d | vivants %d | non mesurables %d",
+        totals["mort"], totals["rug"], totals["vivant"], totals["non_mesurable"],
     )
     log.info(
         "mints distincts %d | appels Helius %d (pertes %d) | CoinGecko %d "

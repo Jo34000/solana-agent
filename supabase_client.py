@@ -41,6 +41,12 @@ Colonnes attendues sur sol_smart_wallets :
     active            boolean
     activation_reason text
     updated_at        timestamptz
+    -- phase 3, backtest de validation :
+    validated_at      timestamptz  (NULL = a backtester)
+    tokens_evaluated  integer
+    win_rate          numeric
+    median_perf       numeric
+    rug_rate          numeric
 """
 
 from __future__ import annotations
@@ -258,6 +264,60 @@ def upsert_smart_wallets(rows: list[dict]) -> int:
 
     log.info(
         "Supabase : %d/%d wallets upsertes dans %s",
+        written, len(rows), SMART_WALLETS_TABLE,
+    )
+    if written < len(rows):
+        raise RuntimeError(
+            f"Ecriture partielle dans {SMART_WALLETS_TABLE} : {written} "
+            f"confirmees sur {len(rows)} envoyees (verifier les policies RLS)."
+        )
+    return written
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 : backtest de validation
+# ---------------------------------------------------------------------------
+
+
+def fetch_wallets_to_validate(min_winners: int, limit: int = 2000) -> list[dict]:
+    """Candidats au backtest : assez de winners, pas encore valides."""
+    response = (
+        get_client()
+        .table(SMART_WALLETS_TABLE)
+        .select("wallet, winners_count, best_rank")
+        .gte("winners_count", min_winners)
+        .is_("validated_at", "null")
+        .order("winners_count", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    rows = response.data or []
+    log.info(
+        "Supabase : %d wallets a backtester (winners_count >= %d)",
+        len(rows), min_winners,
+    )
+    return rows
+
+
+def update_wallet_validation(rows: list[dict]) -> int:
+    """Ecrit le verdict du backtest. Leve si l'ecriture est partielle."""
+    if not rows:
+        log.info("Supabase : aucun verdict de validation a ecrire")
+        return 0
+
+    written = 0
+    for start in range(0, len(rows), _PAGE_SIZE):
+        batch = rows[start:start + _PAGE_SIZE]
+        response = (
+            get_client()
+            .table(SMART_WALLETS_TABLE)
+            .upsert(batch, on_conflict="wallet")
+            .execute()
+        )
+        written += len(response.data or [])
+
+    log.info(
+        "Supabase : %d/%d verdicts ecrits dans %s",
         written, len(rows), SMART_WALLETS_TABLE,
     )
     if written < len(rows):

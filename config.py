@@ -61,6 +61,33 @@ ACTIVATION_MIN_WINNERS = 2
 # AJUSTABLE - rang a partir duquel un wallet est active sur un seul winner.
 ACTIVATION_TOP_RANK = 20
 
+# --- Phase 3 : backtest de validation ------------------------------------
+
+# AJUSTABLE - perimetre des candidats a backtester.
+VALIDATION_MIN_WINNERS = 2
+
+# AJUSTABLE - transactions remontees par wallet (historique recent).
+VALIDATION_TX_LIMIT = 500
+
+# AJUSTABLE - minimum de tokens mesures pour oser statuer sur un wallet.
+VALIDATION_MIN_TOKENS = 3
+
+# AJUSTABLE - seuils de validation.
+VALIDATION_MIN_WIN_RATE = 0.40
+VALIDATION_MAX_RUG_RATE = 0.50
+
+# AJUSTABLE - plafond haut d'activite : au-dela, bot ou MEV, exclu. Il n'y a
+# volontairement PAS de plancher : cote ETH, exclure les wallets a faible
+# historique avait elimine exactement les traders experimentes recherches.
+VALIDATION_MAX_TX = 50_000
+
+# AJUSTABLE - cap applique a chaque performance AVANT toute mediane : un x300
+# isole ne doit pas porter le verdict d'un wallet.
+PERF_CAP = 20.0
+
+# AJUSTABLE - sous cette liquidite, le pool n'est pas jugé mesurable.
+MIN_POOL_LIQUIDITY_USD = 5_000
+
 # --------------------------------------------------------------------------
 # Constantes techniques (non ajustables a la volee)
 # --------------------------------------------------------------------------
@@ -76,6 +103,10 @@ MAX_RETRIES = 3
 ANALYZED_TABLE = "sol_analyzed_tokens"
 EARLY_BUYS_TABLE = "sol_early_buys"
 SMART_WALLETS_TABLE = "sol_smart_wallets"
+
+# Seuil de performance a partir duquel un token compte comme gagnant dans le
+# backtest (x2 sur le prix d'entree).
+VALIDATION_WIN_MULTIPLE = 2.0
 
 ENV_VARS = (
     "COINGECKO_API_KEY",
@@ -133,4 +164,8 @@ def diagnose_environment() -> bool:
              "activation >= %d winners ou rang <= %d ---",
              EARLY_TX_LIMIT, EARLY_BUYER_MAX_RANK,
              ACTIVATION_MIN_WINNERS, ACTIVATION_TOP_RANK)
+    log.info("--- Validation : %d tx/wallet | >= %d tokens | win rate >= %s | "
+             "rug rate <= %s | cap x%s ---",
+             VALIDATION_TX_LIMIT, VALIDATION_MIN_TOKENS,
+             VALIDATION_MIN_WIN_RATE, VALIDATION_MAX_RUG_RATE, PERF_CAP)
     return has_key

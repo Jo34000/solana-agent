@@ -159,6 +159,11 @@ def top_pools(page: int = 1, sort: str | None = None) -> PoolPage | None:
     return _pool_list(f"/networks/{NETWORK}/pools", page, extra)
 
 
+def token_pools(mint: str, page: int = 1) -> PoolPage | None:
+    """Pools d'un token donne, pour retrouver le plus liquide."""
+    return _pool_list(f"/networks/{NETWORK}/tokens/{mint}/pools", page)
+
+
 def dex_pools(dex: str, page: int = 1, sort: str | None = None) -> PoolPage | None:
     """Top pools d'un DEX donne."""
     extra = {"sort": sort} if sort else None

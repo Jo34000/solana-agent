@@ -9,6 +9,8 @@ Ce repo est construit par briques.
   lancement) — `RUN_MODE=winners`.
 - **Phase 2** : retrouver leurs premiers acheteurs et accumuler les wallets
   candidats — `RUN_MODE=discovery`.
+- **Phase 3** : backtester ces wallets sur leur historique reel et n'activer
+  que ceux qui performent — `RUN_MODE=validation`.
 
 ## Fichiers
 
@@ -21,6 +23,7 @@ Ce repo est construit par briques.
 | `find_winners.py` | Phase 1 : pipeline de discovery des winners |
 | `helius.py` | Client HTTP Helius (throttle dedie, retry, pertes explicites) |
 | `wallet_discovery.py` | Phase 2 : extraction des early buyers |
+| `wallet_validation.py` | Phase 3 : backtest de validation des wallets |
 | `probe_sort.py` | Sonde jetable : le tri de `/pools` est-il applique ? |
 | `probe_helius.py` | Sonde jetable : forme des reponses Helius (phase 2) |
 
@@ -37,9 +40,9 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `winners` (defaut), `discovery`, `probe`, `probe_helius` — voir Execution |
+| `RUN_MODE` | `winners` (defaut), `discovery`, `validation`, `probe`, `probe_helius` |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
-| `HELIUS_API_KEY` | Cle Helius — requise par `discovery` et `probe_helius` |
+| `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
 | `SUPABASE_URL` | URL du projet Supabase |
 | `SUPABASE_KEY` | Cle Supabase avec droit d'ecriture sur les tables `sol_*` |
 
@@ -55,6 +58,7 @@ Point d'entree unique : `main.py`, qui lit `RUN_MODE`.
 ```bash
 RUN_MODE=winners   python main.py   # defaut : phase 1, tokens winners
 RUN_MODE=discovery python main.py   # phase 2, early buyers
+RUN_MODE=validation python main.py  # phase 3, backtest des wallets
 RUN_MODE=probe     python main.py   # sonde de tri (CoinGecko)
 RUN_MODE=probe_helius python main.py # sonde Helius
 ```
@@ -63,6 +67,7 @@ RUN_MODE=probe_helius python main.py # sonde Helius
 | --- | --- |
 | `winners` (defaut, valeur vide incluse) | phase 1 : tokens winners |
 | `discovery` | phase 2 : early buyers des winners |
+| `validation` | phase 3 : backtest des wallets candidats |
 | `probe` | sonde de tri CoinGecko, le pipeline n'est pas lance |
 | `probe_helius` | sonde Helius, le pipeline n'est pas lance |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
@@ -222,6 +227,70 @@ inter-runs qui les fait basculer.
 Dans la ligne de resume, `acheteurs bruts` et `hors bundle` portent sur le
 run ; `wallets distincts` et `actifs` sont les totaux accumules, puisqu'ils
 viennent du recalcul global.
+
+## Phase 3 : backtest de validation
+
+`RUN_MODE=validation`. `sol_early_buys` ne contient **que des winners** : un
+wallet vu sur dix d'entre eux peut etre un excellent trader comme un sniper
+qui achete tous les lancements, ses pertes etant invisibles par
+construction. Le backtest reconstitue son historique d'achats reel.
+
+### Ce que fait un run
+
+1. Candidats : `sol_smart_wallets WHERE winners_count >=
+   VALIDATION_MIN_WINNERS AND validated_at IS NULL`.
+2. Par wallet : voie A Helius en ordre **descendant** (historique recent) sur
+   `VALIDATION_TX_LIMIT` transactions, puis voie C par lots de 100.
+3. Les transactions sont **remises en ordre chronologique** avant extraction :
+   "premier achat par mint" doit designer la plus ancienne entree de la
+   fenetre, pas la plus recente.
+4. Un achat est une entree de `tokenTransfers` dont `toUserAccount` est le
+   wallet et dont le mint n'est pas du bruit. Comme en phase 2, une vente
+   dans la meme transaction n'annule pas une reception.
+5. Par mint : pool le plus liquide via `/tokens/{mint}/pools`, puis OHLCV
+   journalier sur 180 jours. `perf = max(high APRES l'achat) / close du jour
+   d'achat`, **cappee a `PERF_CAP` avant toute mediane**.
+6. Verdict : `active` si `tokens_evaluated >= VALIDATION_MIN_TOKENS` **et**
+   `win_rate >= VALIDATION_MIN_WIN_RATE` **et**
+   `rug_rate <= VALIDATION_MAX_RUG_RATE`. `validated_at` est ecrit dans tous
+   les cas, echec compris — mais jamais en cas de **PERTE**.
+
+### Pas de plancher d'activite
+
+Le seul filtre sur le volume de transactions est le plafond haut
+(`VALIDATION_MAX_TX`, bot ou MEV). Cote ETH, exclure les wallets a faible
+historique avait elimine exactement les traders experimentes recherches.
+
+Ce plafond n'est applique que si Helius expose un compteur total dans sa
+reponse. La sonde du 18/09 n'a vu que `data` dans `result` : si aucun
+compteur n'est present, **aucun wallet n'est exclu comme bot** et le
+compteur `exclus bot` du resume restera a zero.
+
+### Cache et cout
+
+Les donnees de marche sont mises en cache **par mint pour la duree du run** :
+plusieurs wallets achetent les memes tokens, et chaque mint coute deux appels
+CoinGecko. Le cache retient aussi les mints inmesurables, mais **jamais une
+PERTE** — celle-ci doit pouvoir etre reessayee.
+
+Le budget Helius est affiche au demarrage. La part CoinGecko depend du nombre
+de mints distincts, inconnu a priori, et domine le temps de run : 2 appels a
+2,1 s par mint.
+
+### Deux limites connues
+
+**Les tokens a faible liquidite sont ignores, pas comptes comme rugs.** Un
+pool sous `MIN_POOL_LIQUIDITY_USD` sort du calcul et ne compte pas dans
+`tokens_evaluated`. La clause "liquidite actuelle < seuil" de la definition
+d'un rug en devient inatteignable : seul un volume 24h nul peut declencher
+`is_rug`. Les tokens qui ont rugge le plus franchement sont donc les plus
+susceptibles d'etre ecartes du backtest.
+
+**`active` et `activation_reason` sont partages avec la phase 2.** Un run
+`discovery` posterieur recalcule ces deux colonnes depuis le recoupement et
+ecrasera le verdict du backtest. `validated_at` survit, donc le wallet ne
+sera pas rebacktest. Enchainer `validation` apres `discovery`, jamais
+l'inverse.
 
 ## La sonde `RUN_MODE=probe`
 

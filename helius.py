@@ -117,10 +117,19 @@ def _post(url: str, body: dict, label: str) -> Any | None:
 def transactions_for_address(
     address: str, limit: int, sort_order: str = "asc"
 ) -> list[dict] | None:
-    """Voie A. Signatures les plus ANCIENNES d'une adresse. None = PERTE.
+    """Voie A. Transactions d'une adresse. None = PERTE."""
+    detailed = transactions_for_address_detailed(address, limit, sort_order)
+    return None if detailed is None else detailed[0]
+
+
+def transactions_for_address_detailed(
+    address: str, limit: int, sort_order: str = "asc"
+) -> tuple[list[dict], dict] | None:
+    """(transactions, objet result brut). None = PERTE.
 
     Helius renvoie result = {"data": [...]}, pas une liste : c'est la forme
-    confirmee par la sonde du 18/09.
+    confirmee par la sonde du 18/09. Le result brut est rendu tel quel pour
+    que l'appelant puisse y chercher un eventuel compteur total.
     """
     global _loss_count
     label = f"getTransactionsForAddress({address[:8]}...)"
@@ -154,7 +163,7 @@ def transactions_for_address(
         log.error("PERTE : %s - 'result' sans liste exploitable", label)
         _loss_count += 1
         return None
-    return items
+    return items, result if isinstance(result, dict) else {}
 
 
 def enrich_signatures(signatures: list[str]) -> list[dict] | None:

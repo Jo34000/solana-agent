@@ -345,11 +345,34 @@ Deux leviers, dans cet ordre :
    transactions dans la fenetre... et n'en garder que 30. Une page suffit
    quand les mints distincts sont nombreux : 1900 credits economises sur ce
    seul wallet.
-2. **`getTransfersByAddress`** (a sonder), annoncee a 10 credits par appel.
-   `RUN_MODE=probe_transfers` la teste sur deux wallets deja backtestes,
-   pour comparer aux resultats connus. Un appel par wallet, plus trois
-   variantes de tri et de filtre temporel sur le premier. Aucune ecriture en
-   base, aucune conclusion dans le code.
+2. **`getTransfersByAddress`**, annoncee a 10 credits par appel.
+   `RUN_MODE=probe_transfers` la sonde. Aucune ecriture en base, aucune
+   conclusion dans le code.
+
+#### Acquis de la sonde, run du 19/09 06:26
+
+| Point | Resultat |
+| --- | --- |
+| Forme de la reponse | `result = {data, paginationToken}`, identique a `getTransactionsForAddress` |
+| `sortOrder` | `asc` et `desc` acceptes |
+| `startTime` / `endTime` | **rejetes** (-32602) |
+| Cle inconnue dans la config | fait rejeter l'objet **entier** — n'envoyer que des cles connues |
+| Montant SOL dans une ligne | **absent** : une ligne = une jambe de transfert d'un mint |
+| Depart en `sortOrder=asc` | ~36 j avant maintenant sur `7ioEZjdG`, deja dans la fenetre mature |
+
+#### Ce que la sonde mesure encore
+
+| Section | Question |
+| --- | --- |
+| Plafond de `limit` | 100, 500, 1000, 2000 sont tentes. Le nombre de pages par wallet, donc le budget, en depend directement. |
+| Jambes par signature | Une signature est prise dans le resultat, puis passee a la voie C. Les lignes `getTransfersByAddress` et les `tokenTransfers` / `nativeTransfers` sont affiches cote a cote. Si la jambe wSOL apparait comme une ligne distincte partageant la signature, **le prix d'entree se calcule sans voie C**. |
+| Anciennete des candidats | Un appel ascendant par wallet a `winners_count >= 2`, sans pagination. Distribution en quatre tranches : moins de 10 j, 10-45 j, 45-90 j, au-dela. Si la majorite tombe dans 10-45 j, la collecte ascendante atteint la fenetre mature des la premiere page. |
+
+La derniere section coute un appel par candidat. Si la limite minimale est
+rejetee, elle n'est tentee **qu'une fois** avant bascule sur une valeur
+sure, pour ne pas bruler tous les appels sur un parametre invalide. Le
+total d'appels Helius est affiche en fin de sonde, a recouper avec le
+dashboard.
 
 Quatre motifs d'arret de pagination, testes dans cet ordre a chaque page :
 

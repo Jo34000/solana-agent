@@ -11,6 +11,22 @@ jamais ete testee ici.
 
 Deux wallets DEJA BACKTESTES, pour pouvoir comparer aux resultats connus.
 
+Acquis du run du 19/09 06:26 :
+  - result = {data, paginationToken}, meme forme que
+    getTransactionsForAddress ;
+  - sortOrder asc et desc acceptes ;
+  - startTime / endTime REJETES (-32602), et toute cle inconnue fait
+    rejeter l'objet de config ENTIER. On n'envoie donc que des cles
+    connues ;
+  - aucun champ de montant SOL dans une ligne : une ligne = une jambe de
+    transfert d'un mint ;
+  - sortOrder=asc sur 7ioEZjdG demarre ~36 jours avant maintenant, deja
+    dans la fenetre mature 10-45 j.
+
+Trois questions restent ouvertes, traitees ci-dessous : le plafond de
+limit, la presence de plusieurs jambes par signature, et l'anciennete des
+candidats.
+
 La sonde DECRIT, elle n'interprete pas : aucun parsing metier, aucune
 ecriture en base. Les messages d'erreur bruts de Helius sont affiches tels
 quels — ce sont eux qui donneront les noms exacts de parametres.
@@ -60,6 +76,20 @@ FIELD_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("timestamp", ("timestamp", "blockTime", "block_time", "time")),
     ("slot", ("slot", "blockSlot")),
 )
+
+# Valeurs de limit a sonder : c'est ce plafond qui fixe le nombre de pages
+# par wallet, donc le budget.
+LIMIT_PROBES = (100, 500, 1000, 2000)
+
+# Limite minimale pour le profil d'anciennete : un seul element suffit,
+# seule sa date compte. Repli si la valeur est rejetee.
+MIN_LIMIT = 1
+FALLBACK_LIMIT = 100
+
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+
+# Tranches d'anciennete, en jours.
+AGE_BUCKETS = ((0, 10), (10, 45), (45, 90), (90, float("inf")))
 
 LIST_KEYS = ("data", "items", "transfers", "result", "value")
 TOKEN_KEYS = ("paginationToken", "nextToken", "cursor", "before", "after")
@@ -284,6 +314,207 @@ def probe_variants(address: str) -> None:
                 print(f"    {_order_verdict(items, field)}")
 
 
+def probe_limits(address: str) -> None:
+    """OBJECTIF 1 : quel est le plafond de limit ?
+
+    C'est ce chiffre qui fixe le nombre de pages par wallet, donc le
+    budget. Sans lui aucune estimation n'est possible.
+    """
+    print("\n" + "=" * 72)
+    print("Plafond de limit")
+    print("=" * 72)
+
+    for limit in LIMIT_PROBES:
+        payload, _ = _call(address, {"limit": limit})
+        print(f"\n> limit = {limit}")
+        if payload is None:
+            print("  PERTE, non concluant")
+            continue
+        if not isinstance(payload, dict) or "error" in payload:
+            print("  REJET, message brut complet :")
+            print("    " + _as_json(payload).replace("\n", "\n    "))
+            continue
+        items, path = _extract_list(payload.get("result"))
+        if items is None:
+            print("  accepte, mais aucune liste dans result")
+            continue
+        print(f"  ACCEPTE : {len(items)} elements renvoyes en {path}")
+        if len(items) < limit:
+            print(f"  -> moins d'elements que demande : soit le plafond reel "
+                  f"est {len(items)}, soit le wallet n'en a pas plus")
+
+
+def probe_signature_legs(address: str) -> None:
+    """OBJECTIF 2 : plusieurs jambes par signature ?
+
+    Si getTransfersByAddress expose la jambe SOL/wSOL de l'achat sous forme
+    d'une ligne distincte partageant la meme signature, le prix d'entree se
+    calcule sans voie C. Sinon la voie C ciblee reste necessaire.
+    """
+    print("\n" + "=" * 72)
+    print("Jambes par signature : getTransfersByAddress vs voie C")
+    print("=" * 72)
+
+    payload, _ = _call(address, {"limit": 100})
+    if payload is None or not isinstance(payload, dict) or "error" in payload:
+        print("appel de reference indisponible, section sautee")
+        if isinstance(payload, dict):
+            print(_truncate(_as_json(payload), 700))
+        return
+    items, _ = _extract_list(payload.get("result"))
+    if not items:
+        print("aucun element, section sautee")
+        return
+
+    # On prend la signature la PLUS REPRESENTEE : c'est elle qui repond le
+    # mieux a la question.
+    counts: dict[str, int] = {}
+    for item in items:
+        signature = item.get("signature") if isinstance(item, dict) else None
+        if isinstance(signature, str):
+            counts[signature] = counts.get(signature, 0) + 1
+    if not counts:
+        print("aucun champ 'signature' dans les elements, section sautee")
+        return
+
+    signature, occurrences = max(counts.items(), key=lambda kv: kv[1])
+    uniques = sum(1 for n in counts.values() if n == 1)
+    print(f"{len(items)} lignes pour {len(counts)} signatures distinctes")
+    print(f"  signatures a une seule ligne : {uniques}")
+    print(f"  maximum de lignes pour une signature : {occurrences}")
+    print(f"\nsignature examinee : {signature} ({occurrences} ligne(s))")
+
+    print("\n--- lignes getTransfersByAddress portant cette signature ---")
+    legs = [i for i in items if isinstance(i, dict) and i.get("signature") == signature]
+    for index, leg in enumerate(legs, start=1):
+        mint = leg.get("mint")
+        print(f"  ligne {index} : mint={mint} "
+              f"{'(wSOL)' if mint == WSOL_MINT else ''}")
+        for key in ("tokenAmount", "amount", "uiAmount", "direction", "type",
+                    "fromUserAccount", "toUserAccount"):
+            if key in leg:
+                print(f"      {key:18} = {_short(leg[key])}")
+
+    print("\n--- voie C (POST /v0/transactions) sur cette seule signature ---")
+    enriched = helius.enrich_signatures([signature])
+    if enriched is None:
+        print("  PERTE sur la voie C")
+        return
+    if not enriched:
+        print("  aucune transaction renvoyee")
+        return
+    transaction = enriched[0]
+    for field in ("tokenTransfers", "nativeTransfers"):
+        value = transaction.get(field)
+        print(f"  {field} : "
+              f"{len(value) if isinstance(value, list) else type(value).__name__}")
+        print("    " + _truncate(_as_json(value), 1500).replace("\n", "\n    "))
+
+    mints_a = {l.get("mint") for l in legs}
+    print(f"\n  mints vus cote getTransfersByAddress : {sorted(m for m in mints_a if m)}")
+    print(f"  wSOL present cote getTransfersByAddress : "
+          f"{'OUI' if WSOL_MINT in mints_a else 'NON'}")
+
+
+def _fetch_candidates(min_winners: int = 2) -> list[str]:
+    """Wallets de sol_smart_wallets avec assez de winners. Lecture seule."""
+    try:
+        response = (
+            db.get_client()
+            .table(SMART_WALLETS_TABLE)
+            .select("wallet")
+            .gte("winners_count", min_winners)
+            .limit(5000)
+            .execute()
+        )
+    except Exception as exc:  # noqa: BLE001 - on veut le message brut
+        print(f"  lecture Supabase impossible : {type(exc).__name__} {exc}")
+        return []
+    return [
+        row["wallet"] for row in (response.data or [])
+        if isinstance(row.get("wallet"), str)
+    ]
+
+
+def probe_candidate_ages() -> None:
+    """OBJECTIF 3 : a quelle anciennete demarre l'historique indexe ?
+
+    Un appel ascendant par candidat, limite minimale, sans pagination. Si la
+    majorite tombe dans 10-45 j, la collecte ascendante atteint la fenetre
+    mature des la premiere page et le budget s'effondre.
+    """
+    print("\n" + "=" * 72)
+    print("Profil d'anciennete des candidats (winners_count >= 2)")
+    print("=" * 72)
+
+    wallets = _fetch_candidates()
+    if not wallets:
+        print("aucun candidat, section sautee")
+        return
+    print(f"{len(wallets)} candidats, 1 appel chacun en sortOrder=asc")
+
+    limit = MIN_LIMIT
+    now = datetime.now(timezone.utc).timestamp()
+    buckets = {label: 0 for label in ("<10j", "10-45j", "45-90j", ">90j")}
+    unreadable = 0
+    lost = 0
+    ages: list[float] = []
+
+    for index, wallet in enumerate(wallets):
+        payload, _ = _call(wallet, {"limit": limit, "sortOrder": "asc"})
+
+        # Si la limite minimale est rejetee, on le dit une fois et on
+        # bascule sur une valeur sure plutot que de bruler tous les appels.
+        if (index == 0 and isinstance(payload, dict) and "error" in payload
+                and limit != FALLBACK_LIMIT):
+            print(f"  limit={limit} rejete, message brut :")
+            print("    " + _truncate(_as_json(payload), 500).replace("\n", "\n    "))
+            limit = FALLBACK_LIMIT
+            print(f"  -> bascule sur limit={limit} pour les {len(wallets)} appels")
+            payload, _ = _call(wallet, {"limit": limit, "sortOrder": "asc"})
+
+        if payload is None:
+            lost += 1
+            continue
+        if not isinstance(payload, dict) or "error" in payload:
+            unreadable += 1
+            continue
+        items, _ = _extract_list(payload.get("result"))
+        if not items:
+            unreadable += 1
+            continue
+
+        stamps = [
+            _to_float(i.get("timestamp") or i.get("blockTime"))
+            for i in items if isinstance(i, dict)
+        ]
+        stamps = [s for s in stamps if s > 0]
+        if not stamps:
+            unreadable += 1
+            continue
+
+        age = (now - min(stamps)) / 86400
+        ages.append(age)
+        for (low, high), label in zip(AGE_BUCKETS, buckets):
+            if low <= age < high:
+                buckets[label] += 1
+                break
+
+    print(f"\nplus ancienne activite indexee, {len(ages)} wallets mesures :")
+    total = len(ages) or 1
+    for label, count in buckets.items():
+        share = 100 * count / total
+        print(f"  {label:8} : {count:4d}  ({share:5.1f}%)  "
+              f"{'#' * int(share / 2)}")
+    if unreadable or lost:
+        print(f"  non exploitables : {unreadable} | PERTE : {lost}")
+    if ages:
+        ordered = sorted(ages)
+        median = ordered[len(ordered) // 2]
+        print(f"  min {min(ages):.1f} j | mediane {median:.1f} j | "
+              f"max {max(ages):.1f} j")
+
+
 def main() -> None:
     setup_logging()
     diagnose_environment()
@@ -305,8 +536,15 @@ def main() -> None:
         print()
         probe_wallet(second)
 
+    probe_limits(WALLET_FULL)
+    probe_signature_legs(WALLET_FULL)
+    probe_candidate_ages()
+
     calls, losses = helius.request_stats()
-    print(f"\nAppels Helius effectues : {calls} (pertes {losses})")
+    print("\n" + "=" * 72)
+    print(f"Appels Helius effectues : {calls} (pertes {losses})")
+    print("A recouper avec le dashboard Helius pour connaitre le cout reel "
+          "par appel.")
 
 
 if __name__ == "__main__":

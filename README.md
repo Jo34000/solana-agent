@@ -26,6 +26,7 @@ Ce repo est construit par briques.
 | `wallet_validation.py` | Phase 3 : backtest de validation des wallets |
 | `probe_sort.py` | Sonde jetable : le tri de `/pools` est-il applique ? |
 | `probe_helius.py` | Sonde jetable : forme des reponses Helius (phase 2) |
+| `probe_transfers.py` | Sonde jetable : `getTransfersByAddress` (10 credits vs 100) |
 
 ## Installation
 
@@ -40,7 +41,7 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `winners` (defaut), `discovery`, `validation`, `probe`, `probe_helius` |
+| `RUN_MODE` | `winners` (defaut), `discovery`, `validation`, `probe`, `probe_helius`, `probe_transfers` |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
 | `SUPABASE_URL` | URL du projet Supabase |
@@ -61,6 +62,7 @@ RUN_MODE=discovery python main.py   # phase 2, early buyers
 RUN_MODE=validation python main.py  # phase 3, backtest des wallets
 RUN_MODE=probe     python main.py   # sonde de tri (CoinGecko)
 RUN_MODE=probe_helius python main.py # sonde Helius
+RUN_MODE=probe_transfers python main.py # sonde getTransfersByAddress
 ```
 
 | `RUN_MODE` | Effet |
@@ -70,6 +72,7 @@ RUN_MODE=probe_helius python main.py # sonde Helius
 | `validation` | phase 3 : backtest des wallets candidats |
 | `probe` | sonde de tri CoinGecko, le pipeline n'est pas lance |
 | `probe_helius` | sonde Helius, le pipeline n'est pas lance |
+| `probe_transfers` | sonde `getTransfersByAddress`, le pipeline n'est pas lance |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -326,6 +329,41 @@ matures manquent peut-etre. Le resume final compte les wallets concernes.
 > cela ne couvre que **2,5 jours** — la profondeur de 45 j demanderait
 > environ 360 pages. Les wallets hyperactifs finiront donc en
 > `limite_pages`. C'est le warning qui le dira, wallet par wallet.
+
+### Le cout est la contrainte dominante
+
+Le run du 18/09 a consomme **396 480 credits** sur le million mensuel du
+free tier, pour 60 wallets sur 117 : `getTransactionsForAddress` coute 100
+credits par appel et le run en a fait 2384.
+
+Deux leviers, dans cet ordre :
+
+1. **Arret anticipe de la pagination** (en place). Les achats sont extraits
+   **au fil des pages** plutot qu'apres coup, ce qui permet de s'arreter des
+   que `VALIDATION_MAX_TOKENS_PER_WALLET` achats matures **distincts** sont
+   collectes. Les logs montraient `FatpigGT` lisant 20 pages pour 9516
+   transactions dans la fenetre... et n'en garder que 30. Une page suffit
+   quand les mints distincts sont nombreux : 1900 credits economises sur ce
+   seul wallet.
+2. **`getTransfersByAddress`** (a sonder), annoncee a 10 credits par appel.
+   `RUN_MODE=probe_transfers` la teste sur deux wallets deja backtestes,
+   pour comparer aux resultats connus. Un appel par wallet, plus trois
+   variantes de tri et de filtre temporel sur le premier. Aucune ecriture en
+   base, aucune conclusion dans le code.
+
+Quatre motifs d'arret de pagination, testes dans cet ordre a chaque page :
+
+| Motif | Sens |
+| --- | --- |
+| `echantillon_complet` | assez d'achats matures distincts, on s'arrete |
+| `profondeur_atteinte` | la profondeur visee est couverte |
+| `historique_epuise` | plus de `paginationToken` |
+| `limite_pages` | **garde-fou atteint**, profondeur NON couverte |
+
+Une consequence a connaitre : en parcourant du plus recent au plus ancien,
+un mint achete plusieurs fois est enregistre a sa **premiere rencontre**,
+donc sur la page la plus recente ou il apparait. L'arret anticipe interdit
+de connaitre son achat le plus ancien sans lire toutes les pages.
 
 ### Pourquoi la maturite
 

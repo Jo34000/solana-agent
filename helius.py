@@ -122,6 +122,16 @@ def transactions_for_address(
     return None if detailed is None else detailed[0]
 
 
+def rpc(method: str, params: Any) -> Any | None:
+    """Appel JSON-RPC generique. None = PERTE. Rend le payload tel quel,
+    erreur JSON-RPC comprise : c'est ce que les sondes veulent voir."""
+    return _post(
+        f"{RPC_URL}?api-key={api_key()}",
+        {"jsonrpc": "2.0", "id": "sonde", "method": method, "params": params},
+        method,
+    )
+
+
 def pagination_token(result: dict) -> str | None:
     """Jeton de page suivante, s'il y en a un."""
     token = result.get("paginationToken")

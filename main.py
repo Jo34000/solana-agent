@@ -8,6 +8,7 @@ variable d'environnement RUN_MODE.
     RUN_MODE=validation            -> phase 3 : backtest des wallets
     RUN_MODE=probe                 -> sonde de tri (CoinGecko)
     RUN_MODE=probe_helius          -> sonde Helius
+    RUN_MODE=probe_transfers       -> sonde getTransfersByAddress
 
 Start Command Railway : python main.py
 """
@@ -22,7 +23,10 @@ from config import setup_logging
 
 log = logging.getLogger("solana-agent")
 
-RUN_MODES = ("winners", "discovery", "validation", "probe", "probe_helius")
+RUN_MODES = (
+    "winners", "discovery", "validation",
+    "probe", "probe_helius", "probe_transfers",
+)
 
 
 def resolve_run_mode() -> str:
@@ -51,6 +55,12 @@ def main() -> int:
         import wallet_discovery
 
         wallet_discovery.run()
+        return 0
+
+    if mode == "probe_transfers":
+        import probe_transfers
+
+        probe_transfers.main()
         return 0
 
     if mode == "probe_helius":

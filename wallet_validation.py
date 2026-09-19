@@ -274,26 +274,37 @@ def build_verdict(wallet: str, perfs: list[float], rugs: int) -> dict:
     }
 
 
-def collect_transactions(
-    wallet: str,
-) -> tuple[list[dict], int, str, dict] | None:
-    """Pagine la voie A jusqu'a la profondeur visee.
+def collect_purchases(wallet: str) -> tuple[dict, dict] | None:
+    """Pagine la voie A en extrayant les achats AU FIL des pages.
 
-    Retourne (transactions, pages lues, motif d'arret, result de la 1re
-    page). None = PERTE.
+    Retourne (achats par mint, statistiques de pagination). None = PERTE.
 
-    Mesure du 18/09 : 500 transactions couvrent 3 heures chez un wallet tres
-    actif. Une seule page ne peut donc jamais atteindre la fenetre 7-60 j ou
-    se trouvent les winners.
+    Les achats sont extraits page par page pour pouvoir s'arreter des que
+    l'echantillon est complet. Les logs du 18/09 montraient des wallets
+    lisant 20 pages (2000 credits) pour ne garder que 30 achats : FatpigGT
+    avait 9516 transactions dans la fenetre pour 30 echantillonnes.
+
+    Quatre conditions d'arret, testees dans cet ordre a chaque page :
+      echantillon_complet  : assez d'achats matures distincts
+      profondeur_atteinte  : la page depasse VALIDATION_TARGET_AGE_DAYS
+      historique_epuise    : plus de token de pagination
+      limite_pages         : garde-fou
+
+    Les pages viennent du plus recent au plus ancien et les achats sont
+    pris dans cet ordre, sans aucun tri par performance.
     """
-    target_ts = (
-        datetime.now(timezone.utc).timestamp()
-        - VALIDATION_TARGET_AGE_DAYS * 86400
-    )
-    collected: list[dict] = []
+    now_ts = datetime.now(timezone.utc).timestamp()
+    newest_ts = now_ts - VALIDATION_MIN_TOKEN_AGE_DAYS * 86400
+    oldest_ts = now_ts - VALIDATION_TARGET_AGE_DAYS * 86400
+
+    purchases: dict[str, dict] = {}
     token: str | None = None
     pages = 0
     first_result: dict = {}
+    total_tx = 0
+    in_window_total = 0
+    block_times: list[float] = []
+    stop_reason = "limite_pages"
 
     while pages < VALIDATION_MAX_PAGES:
         detailed = helius.transactions_for_address_detailed(
@@ -305,20 +316,71 @@ def collect_transactions(
         pages += 1
         if pages == 1:
             first_result = result
-        collected.extend(items)
+        total_tx += len(items)
+        block_times.extend(
+            _to_float(item.get("blockTime")) for item in items
+            if isinstance(item, dict) and _to_float(item.get("blockTime")) > 0
+        )
 
         if not items:
-            return collected, pages, "historique_epuise", first_result
+            stop_reason = "historique_epuise"
+            break
+
+        # Fenetre de maturite, sur le blockTime que la voie A porte deja :
+        # enrichir des transactions qu'on ecarterait ensuite serait du
+        # quota perdu.
+        in_window = [
+            item for item in items
+            if isinstance(item, dict) and item.get("err") is None
+            and isinstance(item.get("signature"), str)
+            and oldest_ts <= _to_float(item.get("blockTime")) <= newest_ts
+        ]
+        in_window_total += len(in_window)
+
+        if in_window:
+            enriched = helius.enrich_signatures(
+                [item["signature"] for item in in_window]
+            )
+            if enriched is None:
+                return None
+            chronological = sorted(
+                enriched, key=lambda t: _to_float(t.get("timestamp"))
+            )
+            for mint, purchase in extract_purchases(chronological, wallet).items():
+                # Un mint deja vu l'a ete sur une page plus RECENTE : on
+                # garde cette premiere rencontre, l'ordre de parcours etant
+                # descendant.
+                if mint not in purchases and purchase["bought_at"] <= newest_ts:
+                    purchases[mint] = purchase
+
+        if len(purchases) >= VALIDATION_MAX_TOKENS_PER_WALLET:
+            stop_reason = "echantillon_complet"
+            break
 
         last = _to_float(items[-1].get("blockTime"))
-        if last and last <= target_ts:
-            return collected, pages, "profondeur_atteinte", first_result
+        if last and last <= oldest_ts:
+            stop_reason = "profondeur_atteinte"
+            break
 
         token = helius.pagination_token(result)
         if not token:
-            return collected, pages, "historique_epuise", first_result
+            stop_reason = "historique_epuise"
+            break
 
-    return collected, pages, "limite_pages", first_result
+    coverage = (
+        ((now_ts - min(block_times)) / 86400, (now_ts - max(block_times)) / 86400)
+        if block_times else (0.0, 0.0)
+    )
+    stats = {
+        "pages": pages,
+        "pages_saved": VALIDATION_MAX_PAGES - pages,
+        "transactions": total_tx,
+        "in_window": in_window_total,
+        "coverage": coverage,
+        "stop_reason": stop_reason,
+        "first_result": first_result,
+    }
+    return purchases, stats
 
 
 def validate_wallet(wallet: str) -> dict | None:
@@ -326,69 +388,19 @@ def validate_wallet(wallet: str) -> dict | None:
 
     Retourne {"bot": True} quand le wallet depasse VALIDATION_MAX_TX.
     """
-    collected = collect_transactions(wallet)
+    collected = collect_purchases(wallet)
     if collected is None:
         return None
-    transactions, pages, stop_reason, first_result = collected
+    purchases, pagination = collected
 
-    total = total_transactions(first_result)
+    total = total_transactions(pagination.pop("first_result", {}))
     if total is not None and total > VALIDATION_MAX_TX:
         return {"bot": True, "total_tx": total}
 
     now_ts = datetime.now(timezone.utc).timestamp()
-    block_times = [
-        _to_float(item.get("blockTime")) for item in transactions
-        if isinstance(item, dict) and _to_float(item.get("blockTime")) > 0
-    ]
-    coverage = (
-        ((now_ts - max(block_times)) / 86400, (now_ts - min(block_times)) / 86400)
-        if block_times else (0.0, 0.0)
-    )
-
-    pagination = {
-        "pages": pages,
-        "transactions": len(transactions),
-        "coverage": coverage,
-        "stop_reason": stop_reason,
-    }
-
-    # Fenetre de maturite : entre VALIDATION_MIN_TOKEN_AGE_DAYS et
-    # VALIDATION_TARGET_AGE_DAYS. Filtrer ICI, sur le blockTime que la voie A
-    # porte deja, evite d'enrichir des transactions qu'on ecarterait ensuite.
-    newest_ts = now_ts - VALIDATION_MIN_TOKEN_AGE_DAYS * 86400
-    oldest_ts = now_ts - VALIDATION_TARGET_AGE_DAYS * 86400
-    in_window = [
-        item for item in transactions
-        if isinstance(item, dict) and item.get("err") is None
-        and isinstance(item.get("signature"), str)
-        and oldest_ts <= _to_float(item.get("blockTime")) <= newest_ts
-    ]
-    pagination["in_window"] = len(in_window)
-
-    if not in_window:
-        verdict = build_verdict(wallet, [], 0)
-        verdict["activation_reason"] = "historique_trop_recent"
-        verdict.update(_bought=0, _mature=0, _sampled=0, _ages=(),
-                       _counts=Counter(), _pagination=pagination)
-        return verdict
-
-    enriched = helius.enrich_signatures([item["signature"] for item in in_window])
-    if enriched is None:
-        return None
-
-    # La voie A est interrogee en ordre DESCENDANT : on remet les
-    # transactions en ordre chronologique pour que "premier achat" designe
-    # bien la plus ancienne entree de la fenetre.
-    chronological = sorted(enriched, key=lambda t: _to_float(t.get("timestamp")))
-    purchases = extract_purchases(chronological, wallet)
-
-    # Second filtre de maturite, sur le timestamp de la voie C cette fois :
-    # c'est lui qui fait foi pour la date d'achat.
-    cutoff = now_ts - VALIDATION_MIN_TOKEN_AGE_DAYS * 86400
-    mature = [p for p in purchases.values() if p["bought_at"] <= cutoff]
-
-    # Echantillon des plus RECENTS parmi les matures. Jamais un tri sur la
-    # performance : cela biaiserait mecaniquement le win rate.
+    # Les achats collectes sont deja matures : le filtre porte sur le
+    # timestamp de la voie C, qui fait foi pour la date d'achat.
+    mature = list(purchases.values())
     sample = sorted(
         mature, key=lambda p: p["bought_at"], reverse=True
     )[:VALIDATION_MAX_TOKENS_PER_WALLET]
@@ -478,7 +490,9 @@ def run() -> int:
     lost: list[str] = []
     totals: Counter = Counter()
     pages_read = 0
+    pages_saved = 0
     capped = 0
+    early = 0
 
     for index, candidate in enumerate(candidates, start=1):
         wallet = candidate.get("wallet")
@@ -504,10 +518,17 @@ def run() -> int:
 
         if pagination:
             oldest, newest = pagination["coverage"]
+            reason = {
+                "echantillon_complet": "arret sur echantillon complet",
+                "profondeur_atteinte": "profondeur atteinte",
+                "historique_epuise": "historique epuise",
+                "limite_pages": "LIMITE de pages",
+            }[pagination["stop_reason"]]
             log.info(
-                "%s... : %d pages, %d tx, couverture %.0f a %.0f j "
-                "(%d dans la fenetre)",
-                wallet[:8], pagination["pages"], pagination["transactions"],
+                "%s... : %d pages lues (%s), %d economisees | %d tx, "
+                "couverture %.0f a %.0f j (%d dans la fenetre)",
+                wallet[:8], pagination["pages"], reason,
+                pagination["pages_saved"], pagination["transactions"],
                 newest, oldest, pagination["in_window"],
             )
             if pagination["stop_reason"] == "limite_pages":
@@ -520,8 +541,11 @@ def run() -> int:
                     VALIDATION_TARGET_AGE_DAYS, oldest,
                 )
             pages_read += pagination["pages"]
+            pages_saved += pagination["pages_saved"]
             if pagination["stop_reason"] == "limite_pages":
                 capped += 1
+            elif pagination["stop_reason"] == "echantillon_complet":
+                early += 1
 
         # Cette ligne est ce qui permet de verifier que la fenetre mesuree
         # est la bonne : un echantillon trop jeune ne mesure rien.
@@ -576,9 +600,10 @@ def run() -> int:
         len(too_recent), bots,
     )
     log.info(
-        "pagination : %d pages lues au total | %d wallet(s) plafonnes a %d "
-        "pages sans atteindre %d j",
-        pages_read, capped, VALIDATION_MAX_PAGES, VALIDATION_TARGET_AGE_DAYS,
+        "pagination : %d pages lues, %d economisees | %d arrets sur "
+        "echantillon complet | %d plafonnes a %d pages sans atteindre %d j",
+        pages_read, pages_saved, early, capped, VALIDATION_MAX_PAGES,
+        VALIDATION_TARGET_AGE_DAYS,
     )
     log.info(
         "tokens : morts %d | rugs %d | vivants %d | non mesurables %d",

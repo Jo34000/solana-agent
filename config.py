@@ -90,6 +90,27 @@ PERF_CAP = 20.0
 # precisement a mesurer.
 MIN_POOL_LIQUIDITY_USD = 5_000
 
+# --- Phase 3 bis : backtest v2 sur prix d'entree reel ------------------
+
+# Les DEUX adresses du mint SOL apparaissent dans getTransfersByAddress.
+# Celle qui se termine par 1 est celle observee le 19/09 sur les jambes
+# SOL reelles ; chercher uniquement celle en 2 faisait conclure a tort que
+# la jambe SOL etait absente.
+SOL_MINTS = {
+    "So11111111111111111111111111111111111111111",
+    "So11111111111111111111111111111111111111112",
+}
+
+# AJUSTABLE - fenetre mature du backtest v2.
+V2_MAX_AGE_DAYS = 45
+V2_MIN_AGE_DAYS = 10
+
+# AJUSTABLE - achats echantillonnes par wallet.
+V2_MAX_TOKENS = 30
+
+# AJUSTABLE - garde-fou, en pages de 100 lignes (limit plafonne a 100).
+V2_MAX_PAGES = 40
+
 # AJUSTABLE - echantillon de tokens mesures par wallet. Ce sont les plus
 # RECENTS des achats MATURES qui sont gardes, jamais les plus performants :
 # trier sur le gain biaiserait le win rate.
@@ -186,6 +207,9 @@ def diagnose_environment() -> bool:
              "activation >= %d winners ou rang <= %d ---",
              EARLY_TX_LIMIT, EARLY_BUYER_MAX_RANK,
              ACTIVATION_MIN_WINNERS, ACTIVATION_TOP_RANK)
+    log.info("--- Backtest v2 : fenetre %d-%d j | %d achats/wallet | "
+             "%d pages max de 100 lignes ---",
+             V2_MIN_AGE_DAYS, V2_MAX_AGE_DAYS, V2_MAX_TOKENS, V2_MAX_PAGES)
     log.info("--- Validation : %d tx/page, %d pages max, profondeur visee "
              "%d j | fenetre mesuree %d-%d j | >= %d tokens | win rate >= %s "
              "| rug rate <= %s | cap x%s ---",

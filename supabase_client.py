@@ -47,6 +47,10 @@ Colonnes attendues sur sol_smart_wallets :
     win_rate          numeric
     median_perf       numeric
     rug_rate          numeric
+    -- phase 3 bis, backtest v2 sur prix d'entree reel :
+    median_raw_perf   numeric  (avant cap)
+    median_winner_x   numeric  (mediane des seuls gagnants)
+    median_loser_x    numeric  (mediane des seuls perdants)
 """
 
 from __future__ import annotations

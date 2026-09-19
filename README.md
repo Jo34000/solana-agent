@@ -24,6 +24,7 @@ Ce repo est construit par briques.
 | `helius.py` | Client HTTP Helius (throttle dedie, retry, pertes explicites) |
 | `wallet_discovery.py` | Phase 2 : extraction des early buyers |
 | `wallet_validation.py` | Phase 3 : backtest de validation des wallets |
+| `wallet_validation_v2.py` | Phase 3 bis : backtest sur prix d'entree reel |
 | `probe_sort.py` | Sonde jetable : le tri de `/pools` est-il applique ? |
 | `probe_helius.py` | Sonde jetable : forme des reponses Helius (phase 2) |
 | `probe_transfers.py` | Sonde jetable : `getTransfersByAddress` (10 credits vs 100) |
@@ -41,7 +42,7 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `winners` (defaut), `discovery`, `validation`, `probe`, `probe_helius`, `probe_transfers` |
+| `RUN_MODE` | `winners` (defaut), `discovery`, `validation`, `validation_v2`, `probe`, `probe_helius`, `probe_transfers` |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
 | `SUPABASE_URL` | URL du projet Supabase |
@@ -60,6 +61,7 @@ Point d'entree unique : `main.py`, qui lit `RUN_MODE`.
 RUN_MODE=winners   python main.py   # defaut : phase 1, tokens winners
 RUN_MODE=discovery python main.py   # phase 2, early buyers
 RUN_MODE=validation python main.py  # phase 3, backtest des wallets
+RUN_MODE=validation_v2 python main.py # phase 3 bis, prix d'entree reel
 RUN_MODE=probe     python main.py   # sonde de tri (CoinGecko)
 RUN_MODE=probe_helius python main.py # sonde Helius
 RUN_MODE=probe_transfers python main.py # sonde getTransfersByAddress
@@ -70,6 +72,7 @@ RUN_MODE=probe_transfers python main.py # sonde getTransfersByAddress
 | `winners` (defaut, valeur vide incluse) | phase 1 : tokens winners |
 | `discovery` | phase 2 : early buyers des winners |
 | `validation` | phase 3 : backtest des wallets candidats |
+| `validation_v2` | phase 3 bis : backtest sur prix d'entree reel |
 | `probe` | sonde de tri CoinGecko, le pipeline n'est pas lance |
 | `probe_helius` | sonde Helius, le pipeline n'est pas lance |
 | `probe_transfers` | sonde `getTransfersByAddress`, le pipeline n'est pas lance |
@@ -435,6 +438,68 @@ de mints distincts, inconnu a priori, et domine le temps de run : 2 appels a
 ecrasera le verdict du backtest. `validated_at` survit, donc le wallet ne
 sera pas rebacktest. Enchainer `validation` apres `discovery`, jamais
 l'inverse.
+
+## Phase 3 bis : backtest v2 sur prix d'entree reel
+
+`RUN_MODE=validation_v2`, a cote de `validation` sans y toucher. Trois
+constats de la sonde du 19/09 07:17 le fondent.
+
+### Ce que la sonde a etabli
+
+| Point | Resultat |
+| --- | --- |
+| Plafond de `limit` | **100** (`must be in [1, 100]`) |
+| Cout reel | 100 lignes = 57 signatures. **0,175 credit par transaction** contre 0,20 : un gain de **12 %**, pas d'un facteur 10 |
+| Jambe SOL | **presente** dans `getTransfersByAddress`, sous le mint `So1111...1111` — dernier caractere **1**, pas 2. Le controle automatique concluait "absente" parce qu'il cherchait la mauvaise adresse |
+| Anciennete des 117 candidats | mediane **89 j**, max 921 j. `<10j` 1, `10-45j` **30**, `45-90j` 28, `>90j` 58 |
+
+La collecte ascendante n'est economique que pour les **30 wallets** dont
+l'historique commence deja dans la fenetre 10-45 j. Ce sont eux que le
+backtest v2 mesure.
+
+### Le prix d'entree devient reel
+
+Un achat est un groupe de lignes partageant une signature, comportant
+**les deux jambes** :
+
+```
+ligne SOL   : mint dans SOL_MINTS et fromUserAccount == wallet   (SOL sortant)
+ligne token : mint hors SOL_MINTS et toUserAccount == wallet     (token entrant)
+
+prix_entree = somme(uiAmount des jambes SOL sortantes) / uiAmount de la jambe entrante
+```
+
+Un token qui entre **sans** SOL sortant n'est pas un achat : airdrop,
+migration ou transfert. Il est compte a part comme
+`reception sans contrepartie`, jamais comme une perte.
+
+Les prix OHLCV sont en USD et le prix d'entree en SOL. La conversion passe
+par le prix du SOL a la **date de l'achat**, lu sur le pool SOL le plus
+liquide **ayant le SOL en base token** — sans cette condition l'OHLCV
+donnerait le prix de l'autre jeton. Le pool retenu et deux prix
+d'extremite sont logues au demarrage pour etre verifiables.
+
+### Pas de look-ahead
+
+Le pic est le `max(high)` des bougies **strictement posterieures** a la
+date d'achat. La bougie contenant l'achat est exclue : l'utiliser
+reviendrait a connaitre le haut du jour au moment ou l'on achete.
+
+### Gagnants et perdants separes
+
+`median_winner_x` et `median_loser_x` sont calculees **separement**. Un win
+rate de 20 % avec des gagnants a x10 n'est pas un echec, et une mediane
+globale le masque completement. `median_raw_perf` conserve la valeur avant
+cap.
+
+### Ce run n'active personne
+
+`active = false`, `activation_reason = "mesure_v2"`. Les metriques et
+`validated_at` sont ecrits, les seuils seront choisis **apres** avoir vu la
+distribution.
+
+Colonnes supplementaires sur `sol_smart_wallets` : `median_raw_perf`,
+`median_winner_x`, `median_loser_x`.
 
 ## La sonde `RUN_MODE=probe`
 

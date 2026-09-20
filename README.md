@@ -30,6 +30,8 @@ Ce repo est construit par briques.
 | `probe_helius.py` | Sonde jetable : forme des reponses Helius (phase 2) |
 | `probe_transfers.py` | Sonde jetable : `getTransfersByAddress` (10 credits vs 100) |
 | `probe_universe.py` | Sonde jetable : univers des gradues, faisabilite et cout |
+| `probe_universe_v2.py` | Sonde jetable : courbe **derivee** (PDA), compte de migration, echantillon aleatoire |
+| `solana_addr.py` | base58 et derivation de PDA, sans dependance externe |
 
 ## Installation
 
@@ -44,7 +46,7 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe` |
+| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2` |
 | `FORCE_REMEASURE` | `true` pour refaire une mesure deja faite (voir plus bas) |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
@@ -71,6 +73,7 @@ RUN_MODE=probe     python main.py   # sonde de tri (CoinGecko)
 RUN_MODE=probe_helius python main.py # sonde Helius
 RUN_MODE=probe_transfers python main.py # sonde getTransfersByAddress
 RUN_MODE=probe_universe python main.py # sonde univers des gradues
+RUN_MODE=probe_universe_v2 python main.py # sonde univers v2, courbe derivee
 ```
 
 | `RUN_MODE` | Effet |
@@ -85,6 +88,7 @@ RUN_MODE=probe_universe python main.py # sonde univers des gradues
 | `probe_helius` | sonde Helius, le pipeline n'est pas lance |
 | `probe_transfers` | sonde `getTransfersByAddress`, le pipeline n'est pas lance |
 | `probe_universe` | sonde univers des gradues, le pipeline n'est pas lance |
+| `probe_universe_v2` | sonde univers v2, le pipeline n'est pas lance |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -599,6 +603,76 @@ susceptibles d'etre fermees.
 Colonnes supplementaires sur `sol_smart_wallets` : `positions_fermees`,
 `positions_ouvertes`, `win_rate_reel`, `median_pnl_x`, `median_gagnant_x`,
 `median_perdant_x`, `sol_investi`, `sol_recupere`, `pnl_global_x`.
+
+## La sonde `RUN_MODE=probe_universe_v2`
+
+Le run `probe_universe` du 20/09 13:25 a valide **une** chose : le prix a
+un instant donne se reconstruit a **1,11 appel par point obtenu**. Trois
+sections n'ont pas mesure ce qu'elles devaient, et cette sonde les refait.
+Aucune ecriture en base, cles masquees, `HELIUS_API_KEY` absente -> la
+sonde leve.
+
+### Quatre sections
+
+| # | Mesure |
+| --- | --- |
+| A | Syntaxe corrigee : `filters.status = "succeeded"` (le 20/09 envoyait `"success"`), et `solMode` compare `"merged"` (defaut) a `"separate"` sur **une meme signature de swap**, lignes cote a cote. |
+| B | La bonding curve est **derivee**, plus devinee : PDA de seeds `["bonding-curve", mint]` sous le programme pump.fun. Creation = 1re transaction de la courbe, graduation = 1re transaction du pool PumpSwap. Toute duree **< 1 min** est signalee comme suspecte. Lecture ascendante jusqu'a la graduation (plafond 50 pages, logue s'il est atteint). |
+| C | Le compte **propre aux migrations** : comptes recurrents a la creation, exclusion des programmes et mints, criblage a 1 appel par compte sur 1 h (sature -> compte de trading), confirmation par 3 transactions portant pump.fun **et** PumpSwap, puis pagination de **deux journees completes**. |
+| D | Echantillon **reellement aleatoire** : 30 mints tires (seed loguee) dans les graduations de C, morts compris. Prix = **mediane des swaps de la page**, achats et ventes, en SOL. Mort = prix a 24 h **< 30 %** du prix a la graduation, et le taux de succes du prix est donne **separement pour morts et vivants**. |
+
+### Pourquoi la section 6 du 20/09 lisait 0 a 1 transaction
+
+La courbe etait devinee : *contrepartie la plus frequente des 50 premieres
+jambes du mint*. Apres graduation, cette contrepartie est tres souvent le
+**pool PumpSwap**, pas la courbe — et toutes ses lignes sont alors
+posterieures a la graduation, donc la boucle sortait des la page 1 avec 0
+acheteur. La sonde v2 ne l'affirme pas : elle **compte**, pour chaque
+token, les lignes anterieures a la graduation cote PDA et cote
+heuristique, et affiche les deux.
+
+`solana_addr.py` fournit la derivation sans aucune dependance nouvelle :
+base58 et PDA (`sha256(seeds || bump || program_id ||
+"ProgramDerivedAddress")`, bump descendant, premiere adresse **hors courbe
+ed25519**) sont reimplementes en Python pur.
+
+### Plafonds et couts
+
+```
+getTransfersByAddress <= 1000   getTransactionsForAddress <= 40
+Enhanced (voie C)     <=    5   CoinGecko                 <= 10
+```
+
+Deux corrections de comptabilite par rapport au 20/09 :
+
+1. **Enhanced n'est plus a 0 credit** mais a **100** (documentation
+   Helius, *"Credit cost: 100 credits per call"*). Le 20/09 sous-estimait
+   la facture de sa section 4.
+2. Les deux journees de la section C sont paginees avec
+   `getTransfersByAddress` (**10** credits) et non
+   `getTransactionsForAddress` (**100**) : c'est dix fois moins cher, et
+   les lignes portent le **mint**, dont la section D a besoin pour tirer
+   son echantillon. Le plafond de 40 `getTransactionsForAddress` est
+   reserve au criblage des comptes.
+
+Le prix du SOL est ici **horaire** (2 appels CoinGecko, 1000 bougies), et
+non journalier comme dans `wallet_validation_v2` : les capitalisations de
+la section D ne portent plus l'imprecision intra-journaliere du 20/09.
+
+### Ce qui a ete signale avant de coder
+
+- Les "comptes recurrents du 20/09" ne sont **nulle part** : la sonde
+  n'ecrit rien et ses sorties ne sont pas persistees. La section C les
+  recalcule, en **un seul** appel Enhanced pour les trois signatures au
+  lieu de trois.
+- **baton** n'est identifiable que par son symbole. S'il n'est pas dans
+  l'echantillon, la sonde le **dit** au lieu de faire semblant ; le
+  diagnostic *pourquoi aucun prix* (mints de la page, presence d'une jambe
+  SOL, nombre de swaps valorisables) s'applique de toute facon a tout
+  token sans prix.
+- Si la section C ne retient aucun compte de migration, la section D se
+  rabat sur les tokens de la section B **en annoncant** que l'echantillon
+  n'est alors ni aleatoire ni representatif.
 
 ## La sonde `RUN_MODE=probe_universe`
 

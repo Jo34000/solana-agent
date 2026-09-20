@@ -61,6 +61,26 @@ Colonnes attendues sur sol_smart_wallets :
     sol_investi       numeric
     sol_recupere      numeric
     pnl_global_x      numeric  (sol_recupere / sol_investi, fermees seules)
+
+Colonnes attendues sur sol_run_log, journal des sondes :
+    run_mode text         (probe_universe_v3, ...)
+    run_at   timestamptz  (horodatage du run, identique pour toutes ses lignes)
+    section  text         (A, B, C, D, E, run)
+    label    text         (intitule court de la mesure)
+    payload  jsonb        (la mesure elle-meme, relisable par le run suivant)
+
+    create table if not exists sol_run_log (
+      id       bigserial primary key,
+      run_mode text not null,
+      run_at   timestamptz not null default now(),
+      section  text,
+      label    text,
+      payload  jsonb
+    );
+
+C'est la SEULE table qu'une sonde ecrit. Elle existe parce qu'une sonde qui
+n'ecrit rien perd ses acquis : le 20/09, les comptes recurrents trouves
+n'etaient plus nulle part au ticket suivant.
 """
 
 from __future__ import annotations
@@ -71,7 +91,12 @@ from datetime import datetime, timedelta, timezone
 
 from supabase import Client, create_client
 
-from config import ANALYZED_TABLE, EARLY_BUYS_TABLE, SMART_WALLETS_TABLE
+from config import (
+    ANALYZED_TABLE,
+    EARLY_BUYS_TABLE,
+    RUN_LOG_TABLE,
+    SMART_WALLETS_TABLE,
+)
 
 log = logging.getLogger("solana-agent")
 
@@ -340,3 +365,35 @@ def update_wallet_validation(rows: list[dict]) -> int:
             f"confirmees sur {len(rows)} envoyees (verifier les policies RLS)."
         )
     return written
+
+
+# ---------------------------------------------------------------------------
+# Journal des sondes
+# ---------------------------------------------------------------------------
+
+
+def insert_run_log(run_mode: str, run_at: str, section: str, label: str,
+                   payload: dict) -> None:
+    """Ecrit une mesure dans sol_run_log. Leve si la base ne confirme rien.
+
+    Une sonde qui perd ses acquis fait recommencer le ticket suivant a
+    zero : cette ecriture est la seule que les sondes s'autorisent, et son
+    echec n'est jamais avale.
+    """
+    response = (
+        get_client()
+        .table(RUN_LOG_TABLE)
+        .insert({
+            "run_mode": run_mode,
+            "run_at": run_at,
+            "section": section,
+            "label": label,
+            "payload": payload,
+        })
+        .execute()
+    )
+    if not (response.data or []):
+        raise RuntimeError(
+            f"Ecriture non confirmee dans {RUN_LOG_TABLE} (section {section}, "
+            f"{label}) : verifier que la table existe et ses policies RLS."
+        )

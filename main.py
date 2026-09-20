@@ -14,6 +14,7 @@ variable d'environnement RUN_MODE.
     RUN_MODE=probe_transfers       -> sonde getTransfersByAddress
     RUN_MODE=probe_universe        -> sonde univers des gradues
     RUN_MODE=probe_universe_v2     -> sonde univers v2 (courbe derivee)
+    RUN_MODE=probe_universe_v3     -> sonde univers v3 (mints d'une journee)
 
 Start Command Railway : python main.py
 """
@@ -32,7 +33,7 @@ RUN_MODES = (
     "idle",
     "winners", "discovery", "validation", "validation_v2", "validation_v3",
     "probe", "probe_helius", "probe_transfers", "probe_universe",
-    "probe_universe_v2",
+    "probe_universe_v2", "probe_universe_v3",
 )
 
 # Defaut volontairement INERTE : chaque deploiement ou redemarrage de
@@ -92,6 +93,13 @@ def main() -> int:
             ", ".join(m for m in RUN_MODES if m != "idle"),
         )
         log.info("Fin de run (idle).")
+        return 0
+
+    if mode == "probe_universe_v3":
+        import probe_universe_v3
+
+        probe_universe_v3.main()
+        log.info("Fin de run (%s).", mode)
         return 0
 
     if mode == "probe_universe_v2":

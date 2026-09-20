@@ -31,6 +31,7 @@ Ce repo est construit par briques.
 | `probe_transfers.py` | Sonde jetable : `getTransfersByAddress` (10 credits vs 100) |
 | `probe_universe.py` | Sonde jetable : univers des gradues, faisabilite et cout |
 | `probe_universe_v2.py` | Sonde jetable : courbe **derivee** (PDA), compte de migration, echantillon aleatoire |
+| `probe_universe_v3.py` | Sonde jetable : mints d'une journee de graduations, prix des tokens morts |
 | `solana_addr.py` | base58 et derivation de PDA, sans dependance externe |
 
 ## Installation
@@ -46,12 +47,13 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2` |
+| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3` |
 | `FORCE_REMEASURE` | `true` pour refaire une mesure deja faite (voir plus bas) |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
 | `SUPABASE_URL` | URL du projet Supabase |
 | `SUPABASE_KEY` | Cle Supabase avec droit d'ecriture sur les tables `sol_*` |
+| `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
 
 En local, un fichier `.env` (git-ignore) suffit. Au demarrage, chaque variable
 est loguee `presente` ou `ABSENTE`, et la source est annoncee explicitement :
@@ -74,6 +76,7 @@ RUN_MODE=probe_helius python main.py # sonde Helius
 RUN_MODE=probe_transfers python main.py # sonde getTransfersByAddress
 RUN_MODE=probe_universe python main.py # sonde univers des gradues
 RUN_MODE=probe_universe_v2 python main.py # sonde univers v2, courbe derivee
+RUN_MODE=probe_universe_v3 python main.py # sonde univers v3, mints d'une journee
 ```
 
 | `RUN_MODE` | Effet |
@@ -89,6 +92,7 @@ RUN_MODE=probe_universe_v2 python main.py # sonde univers v2, courbe derivee
 | `probe_transfers` | sonde `getTransfersByAddress`, le pipeline n'est pas lance |
 | `probe_universe` | sonde univers des gradues, le pipeline n'est pas lance |
 | `probe_universe_v2` | sonde univers v2, le pipeline n'est pas lance |
+| `probe_universe_v3` | sonde univers v3, ecrit dans `sol_run_log` uniquement |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -603,6 +607,79 @@ susceptibles d'etre fermees.
 Colonnes supplementaires sur `sol_smart_wallets` : `positions_fermees`,
 `positions_ouvertes`, `win_rate_reel`, `median_pnl_x`, `median_gagnant_x`,
 `median_perdant_x`, `sol_investi`, `sol_recupere`, `pnl_global_x`.
+
+## La sonde `RUN_MODE=probe_universe_v3`
+
+Le run v2 de 15:35 a etabli trois choses, qui ne sont plus remesurees : la
+**PDA de courbe est correcte (10/10)**, `filters.status = "succeeded"` est
+accepte, `solMode` accepte `merged` et `separate`. Restait l'essentiel :
+**une ligne du compte de migration vaut-elle une graduation**, **quel est
+le mint** de chacune, et **comment se comporte le prix sur des tokens
+morts**.
+
+C'est la premiere sonde qui **ecrit** : `sol_run_log`, et rien d'autre.
+
+### Pourquoi `sol_run_log`
+
+Le 20/09, la sonde avait trouve un compte de migration et l'avait affiche
+en `9C4nRvhh..`. Au ticket suivant, **l'adresse complete n'existait plus
+nulle part** : une sonde qui n'ecrit rien fait recommencer le ticket
+suivant a zero. `sol_run_log` garde une ligne par section, avec sa mesure
+en `jsonb` — dont la **liste datee des mints** d'une journee de
+graduations.
+
+```sql
+create table if not exists sol_run_log (
+  id       bigserial primary key,
+  run_mode text not null,
+  run_at   timestamptz not null default now(),
+  section  text,
+  label    text,
+  payload  jsonb
+);
+```
+
+L'ecriture est testee **au demarrage, avant la moindre depense de
+credits** : table absente -> la sonde affiche ce SQL et s'arrete.
+
+### Quatre sections et un dimensionnement
+
+| # | Mesure |
+| --- | --- |
+| A | Le compte de migration marque-t-il les graduations ? Fenetre de +/- 2 min autour des 10 graduations **deja datees**, signature comparee a celle de la creation du pool. Distribution des montants SOL de la journee : un montant fixe dominant signerait un frais de migration. Conclusion explicite. |
+| B | Les mints d'une journee, par **deux voies comparees sur les memes signatures** : `getTransactionsForAddress` en `transactionDetails: "full"` contre Enhanced par lots de 100. Mints obtenus, appels, credits, cout par graduation. Sortie : la **liste datee** des mints gradues. |
+| C | 30 mints tires au hasard **dans la liste de B** (seed loguee). Trajectoire 8 points, prix en SOL, mediane des swaps. Classement mort / vivant et **taux de succes du prix par classe** — le point a etablir. Courbe lue sur 10 d'entre eux. |
+| D | Prix du SOL sur **au moins 120 jours** en bougies horaires (plusieurs pages), repli journalier **explicite et logue** au-dela. Le compteur de conversions hors couverture doit finir a **0**. |
+| E | Gradues par jour, credits pour lister une journee, credits par token (trajectoire, courbe), puis le budget mensuel a **trois taux d'echantillonnage** : toutes les graduations, une sur trois, une sur dix. |
+
+Si la section B ne produit pas de liste, **la section C s'arrete** : pas de
+repli sur l'echantillon des sondes precedentes, qui ne serait plus
+aleatoire et rendrait le taux de succes par classe ininterpretable.
+
+### Plafonds
+
+```
+getTransfersByAddress <= 800   getTransactionsForAddress <= 20
+Enhanced (voie C)     <=  10   CoinGecko                 <= 10
+```
+
+### Trois ecarts signales avant de coder
+
+1. **`9C4nRvhh` et `39azUYFW` sont des prefixes de 8 caracteres**, pas des
+   adresses : on n'interroge pas Helius avec un prefixe. La sonde
+   **re-derive** les comptes recurrents puis les **rapparie** par prefixe.
+   `MIGRATION_ACCOUNTS` (adresses completes, separees par des virgules)
+   court-circuite cette re-derivation quand on les aura.
+2. **`filters.tokenAccounts` et `transactionDetails: "full"` n'ont jamais
+   ete valides** — et le 17/09 avait etabli que cette methode ne rend que
+   `signature`, `slot`, `err`, `blockTime`. Les cles sont donc testees
+   **une par une** avant d'etre combinees, message de rejet brut affiche :
+   une cle inconnue fait rejeter tout l'objet.
+3. **324 lignes ne sont pas 324 graduations.** Ce sont des *lignes de
+   transfert* : une graduation en produit plusieurs (jambe SOL, jambe
+   token). La section A donne lignes, signatures et mints distincts, et
+   conclut separement sur « une signature = une graduation » et sur « une
+   ligne = une graduation ».
 
 ## La sonde `RUN_MODE=probe_universe_v2`
 

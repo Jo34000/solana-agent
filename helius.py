@@ -238,6 +238,21 @@ def transfers_by_address(
     return items, result if isinstance(result, dict) else {}
 
 
+def get_token_supply(mint: str) -> dict | None:
+    """Supply d'un mint (methode RPC Solana standard). None = PERTE.
+
+    Rend l'objet value brut : {amount, decimals, uiAmount, uiAmountString}.
+    """
+    payload = rpc("getTokenSupply", [mint])
+    if payload is None:
+        return None
+    if not isinstance(payload, dict) or "error" in payload:
+        log.error("PERTE : getTokenSupply(%s) - %s", mint[:8], str(payload)[:200])
+        return None
+    value = (payload.get("result") or {}).get("value")
+    return value if isinstance(value, dict) else None
+
+
 def enrich_signatures(signatures: list[str]) -> list[dict] | None:
     """Voie C. Transactions enrichies. None = PERTE sur au moins un lot.
 

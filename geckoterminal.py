@@ -186,6 +186,34 @@ def dexes(page: int = 1) -> list[dict] | None:
     return data
 
 
+def ohlcv(
+    pool_address: str,
+    timeframe: str = "day",
+    limit: int = 60,
+    before: int | None = None,
+) -> list[list] | None:
+    """Bougies d'un pool. timeframe : day, hour ou minute.
+
+    before (timestamp epoch) remonte a une periode passee precise.
+    """
+    params: dict[str, Any] = {"limit": limit, "currency": "usd"}
+    if before:
+        params["before_timestamp"] = int(before)
+    payload = get(
+        f"/networks/{NETWORK}/pools/{pool_address}/ohlcv/{timeframe}", params
+    )
+    if payload is None:
+        return None
+    candles = (
+        payload.get("data", {}).get("attributes", {}).get("ohlcv_list")
+    )
+    if not isinstance(candles, list):
+        log.error("PERTE : ohlcv/%s %s - payload inattendu",
+                  timeframe, pool_address)
+        return None
+    return candles
+
+
 def ohlcv_day(pool_address: str, limit: int = 60) -> list[list] | None:
     """Bougies journalieres d'un pool. None = perte ou payload inattendu."""
     payload = get(

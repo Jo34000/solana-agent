@@ -29,6 +29,7 @@ Ce repo est construit par briques.
 | `probe_sort.py` | Sonde jetable : le tri de `/pools` est-il applique ? |
 | `probe_helius.py` | Sonde jetable : forme des reponses Helius (phase 2) |
 | `probe_transfers.py` | Sonde jetable : `getTransfersByAddress` (10 credits vs 100) |
+| `probe_universe.py` | Sonde jetable : univers des gradues, faisabilite et cout |
 
 ## Installation
 
@@ -43,7 +44,7 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `winners` (defaut), `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers` |
+| `RUN_MODE` | `winners` (defaut), `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe` |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
 | `SUPABASE_URL` | URL du projet Supabase |
@@ -67,6 +68,7 @@ RUN_MODE=validation_v3 python main.py # phase 3 ter, PnL realise en SOL
 RUN_MODE=probe     python main.py   # sonde de tri (CoinGecko)
 RUN_MODE=probe_helius python main.py # sonde Helius
 RUN_MODE=probe_transfers python main.py # sonde getTransfersByAddress
+RUN_MODE=probe_universe python main.py # sonde univers des gradues
 ```
 
 | `RUN_MODE` | Effet |
@@ -79,6 +81,7 @@ RUN_MODE=probe_transfers python main.py # sonde getTransfersByAddress
 | `probe` | sonde de tri CoinGecko, le pipeline n'est pas lance |
 | `probe_helius` | sonde Helius, le pipeline n'est pas lance |
 | `probe_transfers` | sonde `getTransfersByAddress`, le pipeline n'est pas lance |
+| `probe_universe` | sonde univers des gradues, le pipeline n'est pas lance |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -566,6 +569,60 @@ susceptibles d'etre fermees.
 Colonnes supplementaires sur `sol_smart_wallets` : `positions_fermees`,
 `positions_ouvertes`, `win_rate_reel`, `median_pnl_x`, `median_gagnant_x`,
 `median_perdant_x`, `sol_investi`, `sol_recupere`, `pnl_global_x`.
+
+## La sonde `RUN_MODE=probe_universe`
+
+Mesure de **faisabilite et de cout**, pas de trading. Question posee : un
+humain recevant une alerte avec 5 a 60 min de latence dispose-t-il d'une
+fenetre exploitable sur les tokens gradues ? Avant de chercher des wallets,
+il faut savoir si l'univers est listable retroactivement et a quel prix.
+
+Aucune ecriture en base. Cles masquees. `HELIUS_API_KEY` absente -> la
+sonde leve.
+
+### Six sections
+
+| # | Mesure |
+| --- | --- |
+| 1 | Syntaxe des filtres, **une cle a la fois** (une cle inconnue fait rejeter tout l'objet). Preuve que le filtre est applique : dates dans la plage, montants au-dessus du seuil. `solMode` compare les lignes d'une meme signature avec et sans. |
+| 2 | Prix a un instant donne sur un pool gradue, reconstruit par `jambe SOL / jambe token`. Controle contre l'OHLCV **horaire** CoinGecko. |
+| 3 | Bonding curve retrouvee depuis les premieres jambes du mint, prix avant graduation, duree creation -> graduation. |
+| 4 | **Section cle** : peut-on reconstituer les gradues d'une journee passee ? Comptes recurrents a la creation des pools, puis `new_pools` CoinGecko en alternative. |
+| 5 | Trajectoire d'un echantillon aleatoire (seed loguee), morts compris, a 8 instants apres graduation. Taux de succes **morts vs vivants** : c'est la population que GeckoTerminal perdait en 404. |
+| 6 | Cout des premiers acheteurs : toutes les jambes de la courbe, de la creation a la graduation. |
+
+### Plafonds
+
+Plafonds **globaux** et **par section**. Un plafond atteint coupe la
+section avec un warning et la sonde passe a la suivante — jamais d'arret
+silencieux.
+
+```
+getTransfersByAddress <= 1500   getTransactionsForAddress <= 60
+Enhanced (voie C)     <=   10   CoinGecko                 <= 40
+```
+
+Le cout en credits est affiche au demarrage et en fin de run, par methode,
+**a recouper avec le dashboard Helius**. Le resume final projette combien
+de tokens tiennent dans 1M credits/mois pour (a) lister, (b) suivre en
+trajectoire, (c) suivre avec leurs premiers acheteurs.
+
+### Trois ecarts releves avant ecriture
+
+1. **PumpSwap n'est plus collecte depuis le 18/09** : `PREFERRED_DEXES` ne
+   contient que `meteora`, `raydium-clmm` et `raydium`.
+   `sol_analyzed_tokens` peut donc n'en contenir aucun. Le repli va
+   chercher les pools PumpSwap **directement** via `dex_pools("pumpswap")`
+   plutot que de basculer sur "le DEX le plus represente", ou il n'y a pas
+   de bonding curve et ou les sections 3 et 6 mesureraient autre chose. Si
+   meme ce repli echoue, un **avertissement explicite** le dit.
+2. **Le prix du SOL reutilise de `wallet_validation_v2` est en bougies
+   journalieres** : les capitalisations intra-journalieres de la section 5
+   en heritent d'une imprecision, rappelee dans le resume.
+3. **`new_pools` n'est pas filtrable par DEX** et la pagination est
+   plafonnee a 10 pages sur le plan Demo. Le filtrage PumpSwap se fait
+   cote client, et la sonde **mesure** l'amplitude reellement couverte au
+   lieu de la supposer.
 
 ## La sonde `RUN_MODE=probe`
 

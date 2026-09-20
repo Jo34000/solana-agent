@@ -51,6 +51,16 @@ Colonnes attendues sur sol_smart_wallets :
     median_raw_perf   numeric  (avant cap)
     median_winner_x   numeric  (mediane des seuls gagnants)
     median_loser_x    numeric  (mediane des seuls perdants)
+    -- phase 3 ter, PnL realise en SOL :
+    positions_fermees int
+    positions_ouvertes int
+    win_rate_reel     numeric  (part des positions fermees a pnl_x > 1)
+    median_pnl_x      numeric
+    median_gagnant_x  numeric
+    median_perdant_x  numeric
+    sol_investi       numeric
+    sol_recupere      numeric
+    pnl_global_x      numeric  (sol_recupere / sol_investi, fermees seules)
 """
 
 from __future__ import annotations

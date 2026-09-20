@@ -25,6 +25,7 @@ Ce repo est construit par briques.
 | `wallet_discovery.py` | Phase 2 : extraction des early buyers |
 | `wallet_validation.py` | Phase 3 : backtest de validation des wallets |
 | `wallet_validation_v2.py` | Phase 3 bis : backtest sur prix d'entree reel |
+| `wallet_validation_v3.py` | Phase 3 ter : PnL realise en SOL |
 | `probe_sort.py` | Sonde jetable : le tri de `/pools` est-il applique ? |
 | `probe_helius.py` | Sonde jetable : forme des reponses Helius (phase 2) |
 | `probe_transfers.py` | Sonde jetable : `getTransfersByAddress` (10 credits vs 100) |
@@ -42,7 +43,7 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `winners` (defaut), `discovery`, `validation`, `validation_v2`, `probe`, `probe_helius`, `probe_transfers` |
+| `RUN_MODE` | `winners` (defaut), `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers` |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
 | `SUPABASE_URL` | URL du projet Supabase |
@@ -62,6 +63,7 @@ RUN_MODE=winners   python main.py   # defaut : phase 1, tokens winners
 RUN_MODE=discovery python main.py   # phase 2, early buyers
 RUN_MODE=validation python main.py  # phase 3, backtest des wallets
 RUN_MODE=validation_v2 python main.py # phase 3 bis, prix d'entree reel
+RUN_MODE=validation_v3 python main.py # phase 3 ter, PnL realise en SOL
 RUN_MODE=probe     python main.py   # sonde de tri (CoinGecko)
 RUN_MODE=probe_helius python main.py # sonde Helius
 RUN_MODE=probe_transfers python main.py # sonde getTransfersByAddress
@@ -73,6 +75,7 @@ RUN_MODE=probe_transfers python main.py # sonde getTransfersByAddress
 | `discovery` | phase 2 : early buyers des winners |
 | `validation` | phase 3 : backtest des wallets candidats |
 | `validation_v2` | phase 3 bis : backtest sur prix d'entree reel |
+| `validation_v3` | phase 3 ter : PnL realise en SOL |
 | `probe` | sonde de tri CoinGecko, le pipeline n'est pas lance |
 | `probe_helius` | sonde Helius, le pipeline n'est pas lance |
 | `probe_transfers` | sonde `getTransfersByAddress`, le pipeline n'est pas lance |
@@ -500,6 +503,69 @@ distribution.
 
 Colonnes supplementaires sur `sol_smart_wallets` : `median_raw_perf`,
 `median_winner_x`, `median_loser_x`.
+
+## Phase 3 ter : PnL realise en SOL
+
+`RUN_MODE=validation_v3`. Le run v2 du 19/09 a corrige le prix d'entree
+mais laisse trois defauts, et la metrique elle-meme etait mauvaise.
+
+### Pourquoi v2 ne suffit pas
+
+| Defaut | Constat |
+| --- | --- |
+| **Biais de survie** | 58 erreurs 404 GeckoTerminal. Tous les wallets au-dessus de 50 % de win rate avaient un echantillon ampute : `AkQ4bcEV` 12 tokens sur 30 -> 75 %, `EqQpvukm` 20 sur 38 -> 75 %. Parmi les 24 wallets mesures sur 30 tokens, le meilleur win rate tombait a **40 %**. |
+| **Perfs aberrantes** | `median_raw_perf` a x3483 et x99 : signature d'un prix d'entree calcule sur un montant SOL derisoire. |
+| **Receptions non reconnues** | 1280 ecartees faute de contrepartie SOL, contre 889 tokens classes. |
+
+Et surtout : `perf = pic apres achat / prix d'entree` mesure ce que le
+wallet **aurait** gagne en vendant au sommet exact. Le seuil de gagnant a
+x2 rangeait par ailleurs dans les perdants des tokens a +42 %.
+
+### Ce que v3 mesure
+
+Les ventes sont deja dans les donnees collectees : meme signature, jambe
+token sortante, jambe SOL entrante — le **symetrique exact** de l'achat.
+
+```
+ACHAT : jambe SOL sortante du wallet + jambe d'un autre mint entrante
+VENTE : jambe du mint sortante du wallet + jambe SOL entrante
+
+pnl_x = sol_recupere / sol_investi
+```
+
+**Aucun appel GeckoTerminal, aucune conversion USD, aucun cap.** Les trois
+defauts disparaissent avec la dependance aux prix.
+
+### Trois regles qui comptent
+
+1. **La collecte ne s'arrete pas a la fin de la fenetre de maturite.** Les
+   ventes d'un achat mature lui sont posterieures par construction :
+   `V3_MAX_PAGES` vaut le double de v2 et la pagination va jusqu'au bout de
+   l'historique disponible.
+2. **Une position court a partir de son ouverture.** Seules les ventes
+   posterieures au premier achat mature sont comptees — une vente
+   appartenant a un cycle anterieur gonflerait le PnL sans rien mesurer.
+3. **Les positions ouvertes sont comptees mais exclues du calcul.** Leur
+   valeur actuelle est inconnue sans prix ; les compter reviendrait a
+   inventer un resultat. Une position est fermee a partir de 95 % des
+   tokens revendus — 100 % exact est irrealiste (frais, poussieres,
+   arrondis).
+
+Un achat sous `V3_MIN_SOL_PER_BUY` est ecarte et compte a part comme
+**achat poussiere** : c'est ce denominateur derisoire qui produisait les
+x3483 de v2.
+
+Les positions retenues sont les **plus anciennes** de la fenetre : ce sont
+celles qui ont eu le plus de temps pour etre revendues, donc les plus
+susceptibles d'etre fermees.
+
+### Ce run n'active personne
+
+`active = false`, `activation_reason = "mesure_v3"`.
+
+Colonnes supplementaires sur `sol_smart_wallets` : `positions_fermees`,
+`positions_ouvertes`, `win_rate_reel`, `median_pnl_x`, `median_gagnant_x`,
+`median_perdant_x`, `sol_investi`, `sol_recupere`, `pnl_global_x`.
 
 ## La sonde `RUN_MODE=probe`
 

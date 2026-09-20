@@ -7,6 +7,7 @@ variable d'environnement RUN_MODE.
     RUN_MODE=discovery             -> phase 2 : early buyers des winners
     RUN_MODE=validation            -> phase 3 : backtest des wallets
     RUN_MODE=validation_v2         -> phase 3 bis : backtest prix d'entree reel
+    RUN_MODE=validation_v3         -> phase 3 ter : PnL realise en SOL
     RUN_MODE=probe                 -> sonde de tri (CoinGecko)
     RUN_MODE=probe_helius          -> sonde Helius
     RUN_MODE=probe_transfers       -> sonde getTransfersByAddress
@@ -25,7 +26,7 @@ from config import setup_logging
 log = logging.getLogger("solana-agent")
 
 RUN_MODES = (
-    "winners", "discovery", "validation", "validation_v2",
+    "winners", "discovery", "validation", "validation_v2", "validation_v3",
     "probe", "probe_helius", "probe_transfers",
 )
 
@@ -45,6 +46,12 @@ def main() -> int:
     setup_logging()
     mode = resolve_run_mode()
     log.info("RUN_MODE=%s", mode)
+
+    if mode == "validation_v3":
+        import wallet_validation_v3
+
+        wallet_validation_v3.run()
+        return 0
 
     if mode == "validation_v2":
         import wallet_validation_v2

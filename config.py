@@ -111,6 +111,21 @@ V2_MAX_TOKENS = 30
 # AJUSTABLE - garde-fou, en pages de 100 lignes (limit plafonne a 100).
 V2_MAX_PAGES = 40
 
+# --- Phase 3 ter : PnL realise en SOL -----------------------------------
+
+# AJUSTABLE - plancher par achat. En dessous, l'achat est de la poussiere :
+# un montant SOL derisoire au denominateur produisait des perfs aberrantes
+# (x3483 sur EqQpvukm au run v2 du 19/09).
+V3_MIN_SOL_PER_BUY = 0.01
+
+# AJUSTABLE - positions mesurees par wallet.
+V3_MAX_TOKENS = 30
+
+# AJUSTABLE - garde-fou, le double de v2 : les ventes d'un achat mature
+# sont par definition POSTERIEURES a celui-ci, il faut donc couvrir
+# l'historique au-dela de la fenetre de maturite.
+V3_MAX_PAGES = 80
+
 # AJUSTABLE - echantillon de tokens mesures par wallet. Ce sont les plus
 # RECENTS des achats MATURES qui sont gardes, jamais les plus performants :
 # trier sur le gain biaiserait le win rate.
@@ -207,6 +222,9 @@ def diagnose_environment() -> bool:
              "activation >= %d winners ou rang <= %d ---",
              EARLY_TX_LIMIT, EARLY_BUYER_MAX_RANK,
              ACTIVATION_MIN_WINNERS, ACTIVATION_TOP_RANK)
+    log.info("--- Backtest v3 : PnL realise en SOL | plancher %s SOL/achat "
+             "| %d positions/wallet | %d pages max ---",
+             V3_MIN_SOL_PER_BUY, V3_MAX_TOKENS, V3_MAX_PAGES)
     log.info("--- Backtest v2 : fenetre %d-%d j | %d achats/wallet | "
              "%d pages max de 100 lignes ---",
              V2_MIN_AGE_DAYS, V2_MAX_AGE_DAYS, V2_MAX_TOKENS, V2_MAX_PAGES)

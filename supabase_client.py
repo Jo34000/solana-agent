@@ -397,3 +397,25 @@ def insert_run_log(run_mode: str, run_at: str, section: str, label: str,
             f"Ecriture non confirmee dans {RUN_LOG_TABLE} (section {section}, "
             f"{label}) : verifier que la table existe et ses policies RLS."
         )
+
+
+def fetch_run_log(run_mode: str, section: str, limit: int = 5) -> list[dict]:
+    """Dernieres mesures d'une sonde, la plus recente d'abord.
+
+    C'est la raison d'etre de sol_run_log : une sonde relit ce que la
+    precedente a etabli au lieu de le repayer.
+    """
+    response = (
+        get_client()
+        .table(RUN_LOG_TABLE)
+        .select("run_at, section, label, payload")
+        .eq("run_mode", run_mode)
+        .eq("section", section)
+        .order("run_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    rows = response.data or []
+    log.info("Supabase : %d ligne(s) relues dans %s (%s / section %s)",
+             len(rows), RUN_LOG_TABLE, run_mode, section)
+    return rows

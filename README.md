@@ -32,6 +32,7 @@ Ce repo est construit par briques.
 | `probe_universe.py` | Sonde jetable : univers des gradues, faisabilite et cout |
 | `probe_universe_v2.py` | Sonde jetable : courbe **derivee** (PDA), compte de migration, echantillon aleatoire |
 | `probe_universe_v3.py` | Sonde jetable : mints d'une journee de graduations, prix des tokens morts |
+| `probe_universe_v4.py` | Sonde jetable : liste datee des graduations, jointure par signature |
 | `solana_addr.py` | base58 et derivation de PDA, sans dependance externe |
 
 ## Installation
@@ -47,13 +48,13 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3` |
+| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4` |
 | `FORCE_REMEASURE` | `true` pour refaire une mesure deja faite (voir plus bas) |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
 | `SUPABASE_URL` | URL du projet Supabase |
 | `SUPABASE_KEY` | Cle Supabase avec droit d'ecriture sur les tables `sol_*` |
-| `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
+| `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` et `v4` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
 
 En local, un fichier `.env` (git-ignore) suffit. Au demarrage, chaque variable
 est loguee `presente` ou `ABSENTE`, et la source est annoncee explicitement :
@@ -77,6 +78,7 @@ RUN_MODE=probe_transfers python main.py # sonde getTransfersByAddress
 RUN_MODE=probe_universe python main.py # sonde univers des gradues
 RUN_MODE=probe_universe_v2 python main.py # sonde univers v2, courbe derivee
 RUN_MODE=probe_universe_v3 python main.py # sonde univers v3, mints d'une journee
+RUN_MODE=probe_universe_v4 python main.py # sonde univers v4, liste datee
 ```
 
 | `RUN_MODE` | Effet |
@@ -93,6 +95,7 @@ RUN_MODE=probe_universe_v3 python main.py # sonde univers v3, mints d'une journe
 | `probe_universe` | sonde univers des gradues, le pipeline n'est pas lance |
 | `probe_universe_v2` | sonde univers v2, le pipeline n'est pas lance |
 | `probe_universe_v3` | sonde univers v3, ecrit dans `sol_run_log` uniquement |
+| `probe_universe_v4` | sonde univers v4, **relit** `sol_run_log` et y ecrit |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -607,6 +610,60 @@ susceptibles d'etre fermees.
 Colonnes supplementaires sur `sol_smart_wallets` : `positions_fermees`,
 `positions_ouvertes`, `win_rate_reel`, `median_pnl_x`, `median_gagnant_x`,
 `median_perdant_x`, `sol_investi`, `sol_recupere`, `pnl_global_x`.
+
+## La sonde `RUN_MODE=probe_universe_v4`
+
+Le run de 19:11 a etabli : **frais de migration a 0,0015 SOL** sur 86 % des
+lignes, **324 graduations** le 17/09, **8/10 tokens retrouves** a +/- 120 s
+dont 7 a la signature pres, et **683 transactions** de la journee en **un
+seul** appel `getTransactionsForAddress` en `full` / `limit 1000`.
+
+Restait le livrable : la **liste datee** `[mint, horodatage, signature]`.
+
+### Le bug de la v3
+
+La v3 cherchait le mint **sur les lignes du compte de frais**. Or une
+ligne de frais ne porte **que du SOL** : `token_mint_of` renvoyait `None`
+pour chacune, la liste sortait vide, et la section C s'arretait — ce
+qu'elle devait faire, mais pour la mauvaise raison. Les 341 mints de la
+voie Enhanced etaient un **ensemble** fusionne sur tous les lots, sans
+jointure : personne ne pouvait dire s'ils correspondaient aux 324
+signatures.
+
+La v4 **joint par signature** : pour chacune, Enhanced rend ses
+`tokenTransfers`, on ecarte SOL, WSOL et les stablecoins, et on retient le
+mint du **plus gros** transfert. Le nombre de signatures rendant 0, 1 ou
+plusieurs candidats est logue, et un exemple complet est affiche quand il
+y en a plusieurs.
+
+### Ce que la sonde etablit
+
+| # | Mesure |
+| --- | --- |
+| A | **Couverture temporelle** : date de la premiere transaction du compte de frais, puis recherche des absents sur le compte de secours. Un token gradue **avant** que le compte existe n'est pas un defaut d'appariement, et la sonde le dit. Le critere « signature portant un mint distinct » est **retire** : une ligne de frais ne porte que du SOL, il ne pouvait jamais etre vrai. |
+| B | **La liste datee**, plus le croisement avec le **montant du frais** : les signatures a 0,0150 SOL rendent-elles un mint aussi souvent que celles a 0,0015 ? Un ecart de 20 points ou plus signerait **deux evenements differents**. Puis **validation** sur 3 mints : le PDA de leur bonding curve doit avoir sa **derniere** transaction a l'heure annoncee (la courbe est videe a la migration). |
+| C | Echantillon aleatoire de 30 mints, seed loguee. Trajectoire 8 points, **taux de succes du prix par classe** mort / vivant. Courbe lue sur 10. Sans liste : **section arretee**, jamais de repli. |
+| D | Cout par journee listee, par token (trajectoire), par token (courbe), et le budget mensuel a trois taux d'echantillonnage. |
+
+### Sonde et regime de croisiere
+
+Chaque appel est compte dans l'un des deux regimes :
+
+- **sonde** : l'exploration, payee **une fois** (premiere transaction du
+  compte, appariement des 10 tokens, validation des PDA) ;
+- **croisiere** : ce qu'un run quotidien **repaierait** (scan de la
+  journee, jointure Enhanced, trajectoires, courbes).
+
+Seul le second entre dans la projection mensuelle, et le recapitulatif le
+rappelle explicitement.
+
+### Ce que la v4 relit au lieu de le repayer
+
+`sol_run_log` sert enfin : les **adresses completes** des comptes, que la
+v3 y a ecrites, sont relues au lieu d'etre re-derivees. En revanche les
+**324 signatures n'avaient pas ete persistees** — seul leur nombre l'etait
+— donc la journee est re-scannee (environ 70 credits), et cette fois la
+liste complete part dans la table.
 
 ## La sonde `RUN_MODE=probe_universe_v3`
 

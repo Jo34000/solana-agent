@@ -33,6 +33,7 @@ Ce repo est construit par briques.
 | `probe_universe_v2.py` | Sonde jetable : courbe **derivee** (PDA), compte de migration, echantillon aleatoire |
 | `probe_universe_v3.py` | Sonde jetable : mints d'une journee de graduations, prix des tokens morts |
 | `probe_universe_v4.py` | Sonde jetable : liste datee des graduations, jointure par signature |
+| `probe_universe_v5.py` | Sonde jetable : regle d'adresse de cotation, criblage a 3 points |
 | `solana_addr.py` | base58 et derivation de PDA, sans dependance externe |
 
 ## Installation
@@ -48,13 +49,13 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4` |
+| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5` |
 | `FORCE_REMEASURE` | `true` pour refaire une mesure deja faite (voir plus bas) |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
 | `SUPABASE_URL` | URL du projet Supabase |
 | `SUPABASE_KEY` | Cle Supabase avec droit d'ecriture sur les tables `sol_*` |
-| `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` et `v4` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
+| `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v5` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
 
 En local, un fichier `.env` (git-ignore) suffit. Au demarrage, chaque variable
 est loguee `presente` ou `ABSENTE`, et la source est annoncee explicitement :
@@ -79,6 +80,7 @@ RUN_MODE=probe_universe python main.py # sonde univers des gradues
 RUN_MODE=probe_universe_v2 python main.py # sonde univers v2, courbe derivee
 RUN_MODE=probe_universe_v3 python main.py # sonde univers v3, mints d'une journee
 RUN_MODE=probe_universe_v4 python main.py # sonde univers v4, liste datee
+RUN_MODE=probe_universe_v5 python main.py # sonde univers v5, adresse de cotation
 ```
 
 | `RUN_MODE` | Effet |
@@ -96,6 +98,7 @@ RUN_MODE=probe_universe_v4 python main.py # sonde univers v4, liste datee
 | `probe_universe_v2` | sonde univers v2, le pipeline n'est pas lance |
 | `probe_universe_v3` | sonde univers v3, ecrit dans `sol_run_log` uniquement |
 | `probe_universe_v4` | sonde univers v4, **relit** `sol_run_log` et y ecrit |
+| `probe_universe_v5` | sonde univers v5, relit la liste datee de la v4 |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -610,6 +613,71 @@ susceptibles d'etre fermees.
 Colonnes supplementaires sur `sol_smart_wallets` : `positions_fermees`,
 `positions_ouvertes`, `win_rate_reel`, `median_pnl_x`, `median_gagnant_x`,
 `median_perdant_x`, `sol_investi`, `sol_recupere`, `pnl_global_x`.
+
+## La sonde `RUN_MODE=probe_universe_v5`
+
+Le run de 20:08 a valide la **liste datee de 324 graduations** (PDA 3/3 a
+**0 s** d'ecart), de type `CREATE_POOL` / `PUMP_AMM`, avec `9C4nRvhh` en
+`feePayer`. Restait ce qui bloque depuis trois sondes : **ou lire le
+prix**.
+
+### La regle d'adresse est deduite, pas devinee
+
+Trois sondes ont essaye une adresse au jugé — le pool, le mint, le
+« coffre ». La v5 fait l'inverse : elle part des **10 tokens PumpSwap dont
+`pool_address` est connu**, recupere leur transaction de migration, et
+cherche **ou** cette adresse apparait dans le payload enrichi. Les chemins
+sont normalises (`accountData[*].account`, `tokenTransfers[*].toUserAccount`,
+…) : l'intersection des trois tokens **est** la regle, et elle est ecrite
+telle quelle dans le log.
+
+Elle est ensuite **verifiee** sur 3 mints du 17/09 : l'adresse obtenue
+doit rendre des swaps a T+5 min. Si rien ne se degage, la sonde teste
+**chaque compte** de la transaction de migration un par un et logue lequel
+repond. **Sans adresse qui fonctionne, la section D n'est pas executee** —
+mesurer un prix sur une adresse muette ne mesure rien.
+
+### Les cinq autres sections
+
+| # | Mesure |
+| --- | --- |
+| B | Un seul compte marque-t-il toutes les graduations ? Intersection et union des signatures du 17/09 entre les deux comptes : **l'union est le total reel** du jour. |
+| C | La journee en **un appel** `getTransactionsForAddress` full / limit 1000, soit **100 credits**. Rend-il les mints ? Concordance **mint par mint** avec la liste Enhanced de la v4, et voie a retenir en croisiere. |
+| D | 30 mints tires au hasard, trajectoire 8 points, **taux de succes du prix par classe** mort / vivant, distribution des capitalisations max. |
+| E | **Le criblage a 3 points** (+30 min, +6 h, +24 h) : combien de tokens seraient mal classes, **dans les deux sens**, a quatre seuils de capitalisation. |
+| F | Cout d'une journee listee, du criblage, de la trajectoire, de la courbe. **Plan en deux temps** sur toute la population, compare a l'echantillonnage. |
+
+### Ce que la v5 ne paie pas
+
+- **La liste datee et le cout de la courbe** sont relus dans
+  `sol_run_log` (run `probe_universe_v4`). Repli explicite et logue si
+  elle manque : re-scan de la journee plus jointure Enhanced.
+- **La section E ne coute rien.** Ses 3 points sont un sous-ensemble des 8
+  deja lus en section D : elle les **rejoue** sur les mesures existantes.
+  Le cout annonce pour le criblage est celui d'un run de production, pas
+  une depense de la sonde.
+- **Les `feePayer`** de la section B viennent des transactions deja
+  enrichies en section A.
+
+### Deux ecarts signales avant de coder
+
+1. **La part des `CREATE_POOL` / `PUMP_AMM` non couverte n'est pas
+   mesurable** dans ces plafonds : il faudrait scanner le programme
+   PumpSwap entier, dont le volume depasse de loin les 1000 transactions
+   par appel. A la place, la section B mesure l'intersection et l'union
+   des deux comptes connus, et regarde les `feePayer` deja enrichis : un
+   `feePayer` qui n'est **aucun** des deux comptes est une preuve directe
+   d'un troisieme chemin.
+2. **Le ticket ne fixe pas le seuil de capitalisation** de la section E :
+   la sonde en teste **quatre** (25 k, 50 k, 100 k, 250 k $) et donne la
+   distribution, plutot que d'en inventer un.
+
+### Plafonds
+
+```
+getTransfersByAddress <= 600   getTransactionsForAddress <= 20
+Enhanced (voie C)     <=   6   CoinGecko                 <= 10
+```
 
 ## La sonde `RUN_MODE=probe_universe_v4`
 

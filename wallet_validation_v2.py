@@ -38,6 +38,7 @@ from config import (
     VALIDATION_MIN_WINNERS,
     VALIDATION_WIN_MULTIPLE,
     diagnose_environment,
+    force_remeasure,
     setup_logging,
 )
 # Reutilise le classement mort / rug / vivant et son cache par mint, sans
@@ -447,20 +448,48 @@ def backtest_wallet(wallet: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+MEASURED_REASON = "mesure_v2"
+
+
 def fetch_candidates() -> list[str]:
-    """Wallets winners_count >= VALIDATION_MIN_WINNERS. Lecture seule."""
+    """Wallets winners_count >= VALIDATION_MIN_WINNERS. Lecture seule.
+
+    Les wallets deja mesures par ce mode sont ignores : un redemarrage de
+    conteneur Railway relance le mode en place et rejouerait la mesure pour
+    rien. FORCE_REMEASURE=true est la seule facon de la refaire.
+
+    Le tri se fait en Python et non dans la requete : un .neq sur
+    activation_reason exclurait aussi les lignes NULL, c'est-a-dire les
+    wallets jamais mesures.
+    """
     response = (
         db.get_client()
         .table(SMART_WALLETS_TABLE)
-        .select("wallet")
+        .select("wallet, activation_reason")
         .gte("winners_count", VALIDATION_MIN_WINNERS)
         .limit(5000)
         .execute()
     )
-    rows = response.data or []
+    rows = [r for r in (response.data or [])
+            if isinstance(r.get("wallet"), str)]
     log.info("Supabase : %d wallets winners_count >= %d",
              len(rows), VALIDATION_MIN_WINNERS)
-    return [r["wallet"] for r in rows if isinstance(r.get("wallet"), str)]
+
+    if force_remeasure():
+        log.warning(
+            "FORCE_REMEASURE actif : les %d wallets sont (re)mesures, "
+            "y compris ceux deja traites", len(rows),
+        )
+        return [r["wallet"] for r in rows]
+
+    fresh = [r for r in rows if r.get("activation_reason") != MEASURED_REASON]
+    skipped = len(rows) - len(fresh)
+    if skipped:
+        log.info(
+            "%d wallet(s) deja mesures (%s) ignores. FORCE_REMEASURE=true "
+            "pour les refaire.", skipped, MEASURED_REASON,
+        )
+    return [r["wallet"] for r in fresh]
 
 
 def _histogram(title: str, values: list[float], edges: list[float],

@@ -44,7 +44,8 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `winners` (defaut), `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe` |
+| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe` |
+| `FORCE_REMEASURE` | `true` pour refaire une mesure deja faite (voir plus bas) |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
 | `SUPABASE_URL` | URL du projet Supabase |
@@ -60,7 +61,8 @@ bascule silencieuse en mode degrade.
 Point d'entree unique : `main.py`, qui lit `RUN_MODE`.
 
 ```bash
-RUN_MODE=winners   python main.py   # defaut : phase 1, tokens winners
+RUN_MODE=idle      python main.py   # defaut : diagnostic seul, 0 appel
+RUN_MODE=winners   python main.py   # phase 1, tokens winners
 RUN_MODE=discovery python main.py   # phase 2, early buyers
 RUN_MODE=validation python main.py  # phase 3, backtest des wallets
 RUN_MODE=validation_v2 python main.py # phase 3 bis, prix d'entree reel
@@ -73,7 +75,8 @@ RUN_MODE=probe_universe python main.py # sonde univers des gradues
 
 | `RUN_MODE` | Effet |
 | --- | --- |
-| `winners` (defaut, valeur vide incluse) | phase 1 : tokens winners |
+| `idle` (**defaut**, valeur vide ou absente incluse) | diagnostic seul, **aucun appel API**, aucune ecriture |
+| `winners` | phase 1 : tokens winners |
 | `discovery` | phase 2 : early buyers des winners |
 | `validation` | phase 3 : backtest des wallets candidats |
 | `validation_v2` | phase 3 bis : backtest sur prix d'entree reel |
@@ -88,6 +91,33 @@ RUN_MODE=probe_universe python main.py # sonde univers des gradues
 > `python find_winners.py` fonctionne toujours mais execute *toujours* le
 > pipeline winners — un `RUN_MODE=probe` y serait sans effet, et le script
 > le signale par un warning au lieu de tourner silencieusement.
+
+### Garde-fous d'execution
+
+Le 20/09 a 13:08, un simple demarrage de conteneur Railway a relance
+`validation_v3` sur les 30 wallets deja mesures. **Chaque deploiement ou
+redemarrage rejoue le mode en place**, et consomme du budget pour rien.
+
+Trois garde-fous :
+
+1. **`idle` est le mode par defaut**, valeur vide ou absente incluse. Il
+   logue le diagnostic d'environnement, ne fait **aucun appel API**,
+   n'ecrit rien, et sort avec le code 0. Un redemarrage inattendu ne coute
+   donc plus rien.
+2. **Les modes couteux sont idempotents.** `validation_v2` et
+   `validation_v3` ignorent les wallets qu'ils ont deja mesures
+   (`activation_reason = "mesure_v2"` / `"mesure_v3"`) et loguent combien.
+   Chaque mode n'ignore **que ses propres mesures** : un wallet mesure par
+   v2 reste candidat pour v3. `FORCE_REMEASURE=true` est la seule facon de
+   refaire une mesure, et l'annonce par un warning.
+3. **Toute fin de run logue `Fin de run (<mode>)`** et rend le code 0.
+
+Le tri des wallets deja mesures se fait en Python, pas dans la requete
+PostgREST : un `.neq` sur `activation_reason` exclurait aussi les lignes
+`NULL`, c'est-a-dire les wallets jamais mesures.
+
+Ce principe vaut pour tout futur mode couteux : **un mode relance par
+erreur ne doit rien depenser.**
 
 ## Pipeline
 

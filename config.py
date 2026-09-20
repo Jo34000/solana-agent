@@ -187,6 +187,19 @@ def setup_logging(level: int = logging.INFO) -> None:
     )
 
 
+def force_remeasure() -> bool:
+    """FORCE_REMEASURE actif ?
+
+    Les modes couteux ignorent par defaut ce qu'ils ont deja mesure : un
+    redemarrage de conteneur Railway relance le mode en place et
+    consommerait du budget pour rien. Cette variable est la seule facon de
+    refaire une mesure volontairement.
+    """
+    return os.environ.get("FORCE_REMEASURE", "").strip().lower() in (
+        "1", "true", "yes", "oui"
+    )
+
+
 def coingecko_api_key() -> str | None:
     key = os.environ.get("COINGECKO_API_KEY", "").strip()
     return key or None
@@ -203,6 +216,11 @@ def diagnose_environment() -> bool:
     for name in ENV_VARS:
         present = bool(os.environ.get(name, "").strip())
         log.info("  %-18s : %s", name, "presente" if present else "ABSENTE")
+
+    forced = force_remeasure()
+    log.info("  %-18s : %s", "FORCE_REMEASURE",
+             "ACTIF (les mesures existantes seront refaites)" if forced
+             else "inactif (les wallets deja mesures seront ignores)")
 
     has_key = coingecko_api_key() is not None
     if has_key:

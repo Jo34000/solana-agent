@@ -23,8 +23,8 @@ Colonnes attendues cote Supabase :
     buyers_extracted_at timestamptz  (phase 2 : NULL = a traiter)
 
 Colonnes attendues sur sol_early_buys :
-    mint         text     \ contrainte unique (mint, wallet)
-    wallet       text     /
+    mint         text     -- contrainte unique sur le couple (mint, wallet)
+    wallet       text
     buy_rank     integer  (1, 2, 3... par ordre d'apparition)
     is_bundle    boolean  (transaction dans le slot de lancement)
     sol_amount   numeric  (NULL si non determinable)

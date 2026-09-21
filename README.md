@@ -38,6 +38,7 @@ Ce repo est construit par briques.
 | `probe_universe_v7.py` | Sonde jetable : liste reparee, graduation definie sans le signataire |
 | `graduations.py` | **Regles validees** : ou est le pool, qu'est-ce qu'une graduation, prix median |
 | `exp1_window.py` | **Experience 1** : la fenetre exploitable, ecrite dans `sol_grad_paths` |
+| `exp1_matrix.py` | **Experience 1** : la matrice, calculee sur les donnees deja ecrites |
 | `solana_addr.py` | base58 et derivation de PDA, sans dependance externe |
 
 ## Installation
@@ -53,7 +54,7 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7`, `exp1_window` |
+| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7`, `exp1_window`, `exp1_matrix` |
 | `FORCE_REMEASURE` | `true` pour refaire une mesure deja faite (voir plus bas) |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
@@ -61,7 +62,8 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 | `SUPABASE_KEY` | Cle Supabase avec droit d'ecriture sur les tables `sol_*` |
 | `WINDOW_DAYS` | **Optionnelle**, `exp1_window` : journees completes mesurees (defaut **3**) |
 | `MAX_CREDITS` | **Optionnelle**, `exp1_window` : plafond de credits Helius (defaut **130 000**) |
-| `ENTRY_MCAP_USD` | **Optionnelle**, `exp1_window` : seuil d'entree en etape 2 (defaut **60 000 $**) |
+| `ENTRY_MULTIPLE` | **Optionnelle**, `exp1_window` : seuil d'entree en etape 2, en multiple de la capitalisation a la graduation (defaut **x2**) |
+| `STAGE2_CREDITS` | **Optionnelle**, `exp1_window` : budget propre a l'etape 2 (defaut **30 000**) |
 | `STAGE1_SAMPLE` | **Optionnelle**, `exp1_window` : fraction des graduations mesurees en etape 1 (defaut **1.0**) |
 | `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v7` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
 
@@ -92,6 +94,7 @@ RUN_MODE=probe_universe_v5 python main.py # sonde univers v5, adresse de cotatio
 RUN_MODE=probe_universe_v6 python main.py # sonde univers v6, pool valide
 RUN_MODE=probe_universe_v7 python main.py # sonde univers v7, liste reparee
 RUN_MODE=exp1_window python main.py  # experience 1, fenetre exploitable
+RUN_MODE=exp1_matrix python main.py  # experience 1, matrice (aucun appel API)
 ```
 
 | `RUN_MODE` | Effet |
@@ -113,6 +116,7 @@ RUN_MODE=exp1_window python main.py  # experience 1, fenetre exploitable
 | `probe_universe_v6` | sonde univers v6, regle validee avant usage |
 | `probe_universe_v7` | sonde univers v7, liste reparee et graduation definie |
 | `exp1_window` | **experience 1** : ecrit des resultats dans `sol_grad_paths` |
+| `exp1_matrix` | **experience 1** : calcul de la matrice, **aucun appel API** |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -703,6 +707,51 @@ Les regles validees par les sondes sortent des fichiers jetables : une
 experience ne doit pas dependre d'une sonde. Le module ne fait **aucun
 appel reseau**, il ne lit que des payloads — pool, graduation, signature
 (qui n'est **pas** a la racine), prix median d'une page.
+
+### Le calcul separe : `RUN_MODE=exp1_matrix`
+
+Le run du 21/09 a ete **arrete a la main** pendant l'etape 2 : l'etape 1
+est complete (2 972 graduations), l'etape 2 partielle. `exp1_matrix` ne
+fait **aucun appel API** et relit `sol_grad_paths` pour dire ce que ces
+donnees permettent de conclure — et ce qu'elles ne permettent pas.
+
+**La regle qui gouverne le module** : un token **eligible mais non
+mesure** n'est **ni une perte ni un zero**. Il est absent de la matrice,
+et son absence est comptee a part. Un token mesure dont le prix manque a
+un horizon, lui, est un **inactif** : c'est une mesure.
+
+La section 1 verifie si le sous-ensemble mesure est representatif — par
+journee, par capitalisation a l'entree, et par **quart chronologique**.
+L'etape 2 iterait sur un dictionnaire rempli dans l'ordre de la collecte,
+donc chronologique ; le module le **verifie sur les donnees** au lieu de
+l'affirmer depuis le code.
+
+Deux pieges evites : le seuil relu est celui sous lequel les donnees ont
+ete **prelevees** (60 000 $), pas la nouvelle regle en multiple ; et les
+taux de base sont recalcules sur les **instants de l'etape 1 seuls**,
+`mcap_max_usd` couvrant tous les points et gonflant sinon le resultat des
+seuls tokens suivis.
+
+### Trois corrections pour les runs futurs de `exp1_window`
+
+1. **`MAX_CREDITS` est un plafond CUMULE** sur toutes les executions du
+   meme mode et de la meme fenetre. La consommation des runs precedents
+   est relue dans `sol_run_log` et deduite avant de commencer. Un run tue
+   a la main n'ecrit jamais son recapitulatif : des **points de controle**
+   sont donc ecrits toutes les 100 trajectoires, sans quoi ses credits
+   seraient invisibles au run suivant.
+2. **L'etape 2 a son propre budget** (`STAGE2_CREDITS`, 30 000 par
+   defaut), et les tokens eligibles y sont traites dans un ordre
+   **ALEATOIRE** (seed loguee) : un run interrompu laisse alors un
+   echantillon sans biais, au lieu du debut de la fenetre.
+3. **Le seuil d'entree est un multiple** de la capitalisation a la
+   graduation (`ENTRY_MULTIPLE`, x2 par defaut), plus un montant fixe : un
+   token qui double depuis sa graduation est le meme evenement a 30 k$
+   comme a 300 k$. Cela exige un point de reference **a la graduation**,
+   ajoute a l'etape 1 : celle-ci passe de 3 a 4 instants, soit **41
+   credits par token** au lieu de 31. Une ligne ecrite avant que ce point
+   existe se rabat sur le premier instant disponible, et le repli est
+   compte.
 
 ### Deux ecarts signales avant de coder
 

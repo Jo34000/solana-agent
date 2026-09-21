@@ -92,21 +92,31 @@ def _env_float(name: str, default: float) -> float:
 
 WINDOW_DAYS = _env_int("WINDOW_DAYS", 3)
 MAX_CREDITS = _env_int("MAX_CREDITS", 130_000)
-ENTRY_MCAP_USD = _env_float("ENTRY_MCAP_USD", 60_000.0)
+# Le seuil d'entree en etape 2 est un MULTIPLE de la capitalisation a la
+# graduation, plus un montant fixe : un token qui double depuis sa
+# graduation est le meme evenement a 30 k$ comme a 300 k$.
+ENTRY_MULTIPLE = _env_float("ENTRY_MULTIPLE", 2.0)
 STAGE1_SAMPLE = _env_float("STAGE1_SAMPLE", 1.0)
+STAGE2_CREDITS = _env_int("STAGE2_CREDITS", 30_000)
 RANDOM_SEED = _env_int("RANDOM_SEED", 20260927)
+CHECKPOINT_EVERY = 100
 
 # Une journee n'est mesurable que si son horizon le plus lointain est
 # echu : 7 jours, plus une marge d'un jour.
 MATURITY_DAYS = 8
 
-STAGE1_POINTS = (("5 min", 300), ("15 min", 900), ("60 min", 3600))
+# "grad" est le prix des premiers swaps qui suivent la migration : c'est
+# la reference du seuil d'entree, pas une latence.
+GRAD_POINT = "grad"
+STAGE1_POINTS = ((GRAD_POINT, 0), ("5 min", 300), ("15 min", 900),
+                 ("60 min", 3600))
 STAGE2_POINTS = (("2 h", 7200), ("3 h", 10800), ("6 h", 21600),
                  ("12 h", 43200), ("24 h", 86400), ("3 j", 259200),
                  ("7 j", 604800))
 ALL_POINTS = STAGE1_POINTS + STAGE2_POINTS
 POINT_SECONDS = dict(ALL_POINTS)
-LATENCIES = [label for label, _ in STAGE1_POINTS]
+LATENCIES = [label for label, _ in STAGE1_POINTS
+             if label != GRAD_POINT]
 BASE_RATE_THRESHOLDS = (100_000.0, 1_000_000.0, 5_000_000.0)
 RETURN_BUCKETS = ((2.0, ">= x2"), (5.0, ">= x5"), (10.0, ">= x10"))
 LOSS_BUCKET = 0.3
@@ -121,7 +131,10 @@ CREDIT_COST = {
     "coingecko": 0,
 }
 
+_stage2_rng = random.Random(RANDOM_SEED)
+
 _credits = 0
+_credits_before = 0          # consommation des runs precedents, relue
 _credits_by_section: Counter = Counter()
 _calls: Counter = Counter()
 _current_section = "?"
@@ -144,19 +157,22 @@ def start_section(letter: str, title: str) -> None:
 
 
 def credits_left() -> int:
-    return MAX_CREDITS - _credits
+    """Ce qui reste du plafond CUMULE, runs precedents deduits."""
+    return MAX_CREDITS - _credits_before - _credits
 
 
 def can_spend(method: str) -> bool:
     """Le plafond est un ARRET PROPRE, jamais un silence."""
     global _budget_reached
     cost = CREDIT_COST.get(method, 0)
-    if _credits + cost > MAX_CREDITS:
+    if cost > credits_left():
         if not _budget_reached:
             _budget_reached = True
-            log.warning("PLAFOND DE CREDITS atteint : %d/%d consommes, arret "
-                        "propre. Ce qui est ecrit en base est conserve.",
-                        _credits, MAX_CREDITS)
+            log.warning("PLAFOND DE CREDITS atteint : %d de ce run + %d des "
+                        "runs precedents = %d/%d. Arret propre, ce qui est "
+                        "ecrit en base est conserve.",
+                        _credits, _credits_before,
+                        _credits + _credits_before, MAX_CREDITS)
         return False
     return True
 
@@ -301,6 +317,47 @@ def log_run(section: str, label: str, payload: dict) -> None:
         raise
 
 
+def checkpoint(stage: str, done: int) -> None:
+    """Trace la consommation EN COURS de route.
+
+    Un run tue a la main n'ecrit jamais son recapitulatif : sans ces
+    points de controle, ses credits seraient invisibles au run suivant et
+    le plafond cumule serait faux.
+    """
+    log_run("budget", "avancement", {
+        "jours": window_days(), "etape": stage, "traites": done,
+        "credits_run": _credits,
+        "credits_cumules": _credits_before + _credits,
+    })
+
+
+def consumed_before(days: list[str]) -> int:
+    """Credits deja depenses par ce mode sur CETTE fenetre.
+
+    Les points de controle et les recapitulatifs sont relus ; sur une
+    meme fenetre, le maximum fait foi (les points de controle d'un meme
+    run sont cumulatifs, pas additifs).
+    """
+    total = 0
+    for section, key in (("budget", "credits_run"), ("recap", "credits")):
+        by_run: dict[str, int] = {}
+        try:
+            rows = db.fetch_run_log(RUN_MODE, section, 50)
+        except Exception as error:           # noqa: BLE001
+            log.error("PERTE : relecture de la consommation impossible : %s",
+                      error)
+            return 0
+        for row in rows:
+            payload = row.get("payload") or {}
+            if (payload.get("jours") or []) != days:
+                continue
+            run_at = str(row.get("run_at"))
+            by_run[run_at] = max(by_run.get(run_at, 0),
+                                 int(rules.to_float(payload.get(key))))
+        total += sum(by_run.values())
+    return total
+
+
 CREATE_SQL = """create table if not exists sol_grad_paths (
   mint           text primary key,
   pool           text,
@@ -324,7 +381,7 @@ def check_tables() -> bool:
     try:
         log_run("run", "debut", {"fenetre": window_days(),
                                  "max_credits": MAX_CREDITS,
-                                 "entry_mcap_usd": ENTRY_MCAP_USD,
+                                 "entry_multiple": ENTRY_MULTIPLE,
                                  "stage1_sample": STAGE1_SAMPLE})
     except Exception as error:               # noqa: BLE001
         print(f"\n{RUN_LOG_TABLE} inutilisable : {error}")
@@ -703,10 +760,12 @@ def section_2(universe: list[dict], existing: dict[str, dict],
         if capped:
             stopped = "plafond de credits"
             break
-        if written % 50 == 0 and written:
+        if written % CHECKPOINT_EVERY == 0 and written:
             log.info("  etape 1 : %d ecrites, %d credits consommes",
                      written, _credits)
+            checkpoint("1", written)
 
+    checkpoint("1", written)
     print(f"\n  {written} trajectoires ecrites ({stopped})")
     print(f"  etats des points : {dict(states)}")
     if states["perte"]:
@@ -717,19 +776,56 @@ def section_2(universe: list[dict], existing: dict[str, dict],
             "etats": dict(states), "arret": stopped}
 
 
+def reference_mcap(row: dict) -> tuple[float, str]:
+    """(capitalisation de reference, point utilise).
+
+    La reference est la graduation. Les lignes ecrites avant que ce point
+    existe, ou dont la graduation est inactive, se rabattent sur le
+    premier instant disponible, et le repli est COMPTE.
+    """
+    points = row.get("points") or {}
+    for label, _ in STAGE1_POINTS:
+        entry = points.get(label)
+        if isinstance(entry, dict) and rules.to_float(entry.get("mcap_usd")):
+            return rules.to_float(entry["mcap_usd"]), label
+    return 0.0, "aucun"
+
+
+def is_eligible(row: dict) -> tuple[bool, float, str]:
+    """(eligible a l'etape 2, multiple atteint, point de reference)."""
+    reference, label = reference_mcap(row)
+    if reference <= 0:
+        return False, 0.0, label
+    points = row.get("points") or {}
+    best = max((rules.to_float(entry.get("mcap_usd"))
+                for point, entry in points.items()
+                if point in dict(STAGE1_POINTS) and isinstance(entry, dict)),
+               default=0.0)
+    multiple = best / reference
+    return multiple >= ENTRY_MULTIPLE, multiple, label
+
+
 def section_3(existing: dict[str, dict]) -> dict:
-    start_section("3", f"Etape 2 : au-dela de {ENTRY_MCAP_USD:,.0f} $ de "
-                       f"capitalisation")
+    start_section("3", f"Etape 2 : x{ENTRY_MULTIPLE:g} depuis la "
+                       f"capitalisation a la graduation")
     candidates = []
+    fallbacks: Counter = Counter()
     for mint, record in existing.items():
         if record.get("stage", 0) >= 2 or record.get("status") not in (
                 None, "mesure"):
             continue
-        points = record.get("points") or {}
-        mcaps = [p.get("mcap_usd") for label, p in points.items()
-                 if label in dict(STAGE1_POINTS) and p.get("mcap_usd")]
-        if mcaps and max(mcaps) >= ENTRY_MCAP_USD:
+        eligible, _, label = is_eligible(record)
+        fallbacks[label] += 1
+        if eligible:
             candidates.append((mint, record))
+    if fallbacks and fallbacks.most_common(1)[0][0] != GRAD_POINT:
+        log.warning("Reference de seuil : %s", dict(fallbacks))
+    # Ordre ALEATOIRE : un run interrompu laisse un echantillon sans biais.
+    _stage2_rng.shuffle(candidates)
+    print(f"  ordre de traitement : ALEATOIRE (seed {RANDOM_SEED})")
+    print(f"  references utilisees : {dict(fallbacks)}")
+    budget = min(STAGE2_CREDITS, credits_left())
+    print(f"  budget propre a l'etape 2 : {budget:,} credits")
     unit = len(STAGE2_POINTS) * CREDIT_COST["getTransfersByAddress"]
     print(f"  {len(candidates)} token(s) franchissent le seuil a l'un des "
           f"trois instants")
@@ -738,12 +834,17 @@ def section_3(existing: dict[str, dict]) -> dict:
           f"token(s) suivables")
 
     updated = 0
+    spent_here = 0
     states: Counter = Counter()
     stopped = "termine"
     for mint, record in candidates:
         if not can_spend("getTransfersByAddress"):
             stopped = "plafond de credits"
             break
+        if spent_here + unit > budget:
+            stopped = "budget de l'etape 2 epuise"
+            break
+        before = _credits
         supply = rules.to_float(record.get("supply"))
         points, capped = measure_points(record, STAGE2_POINTS, supply)
         for entry in points.values():
@@ -754,13 +855,20 @@ def section_3(existing: dict[str, dict]) -> dict:
             record["points"] = merged
             record["stage"] = 2
             updated += 1
+            if updated % CHECKPOINT_EVERY == 0:
+                checkpoint("2", updated)
+        spent_here += _credits - before
         if capped:
             stopped = "plafond de credits"
             break
     print(f"\n  {updated} trajectoires completees ({stopped})")
     print(f"  etats des points : {dict(states)}")
+    checkpoint("2", updated)
     return {"candidats": len(candidates), "completees": updated,
-            "etats": dict(states), "arret": stopped}
+            "etats": dict(states), "arret": stopped,
+            "credits_etape2": spent_here, "budget_etape2": budget,
+            "references": dict(fallbacks), "ordre": "aleatoire",
+            "seed": RANDOM_SEED}
 
 
 # ---------------------------------------------------------------------------
@@ -782,29 +890,36 @@ def point_of(row: dict, label: str) -> dict:
     return entry if isinstance(entry, dict) else {}
 
 
-def section_4(rows: list[dict]) -> dict:
-    start_section("4", "La matrice latence x horizon (aucun appel API)")
-    measured = [r for r in rows if (r.get("status") or "mesure") == "mesure"]
-    print(f"  {len(measured)} trajectoire(s) exploitables sur {len(rows)} "
-          f"ligne(s) en base")
-    if not measured:
-        return {"tokens": 0}
+def above_at(row: dict, latency: str) -> bool:
+    """Le token depasse-t-il le seuil d'entree a cette latence ?"""
+    reference, _ = reference_mcap(row)
+    if reference <= 0:
+        return False
+    entry = point_of(row, latency)
+    return (rules.to_float(entry.get("mcap_usd"))
+            >= ENTRY_MULTIPLE * reference)
 
+
+def compute_matrix(rows: list[dict], is_above=above_at,
+                   verbose: bool = True) -> dict:
+    """La matrice latence x horizon. Fonction PURE, aucun appel API.
+
+    is_above decide qui entre dans la mesure : la regle en multiple pour
+    un run neuf, un seuil en dollars pour relire des donnees anciennes.
+    """
+    measured = rows
     matrix: dict[str, Any] = {}
     for latency in LATENCIES:
         seconds = POINT_SECONDS[latency]
         active = [r for r in measured if point_of(r, latency).get("actif")]
-        above = [r for r in active
-                 if rules.to_float(point_of(r, latency).get("mcap_usd"))
-                 >= ENTRY_MCAP_USD]
-        print(f"\n  --- latence {latency} ---")
-        print(f"    actives a T+{latency} : {len(active)}/{len(measured)} "
-              f"({100 * len(active) / len(measured):.1f} %)")
-        print(f"    au-dessus de {ENTRY_MCAP_USD:,.0f} $ : {len(above)} "
-              f"({100 * len(above) / len(measured):.1f} % de l'univers)")
-        coherent(f"au-dessus <= actives ({latency})",
-                 len(above) <= len(active),
-                 f"{len(above)} au-dessus pour {len(active)} actives")
+        above = [r for r in active if is_above(r, latency)]
+        if verbose:
+            print(f"\n  --- latence {latency} ---")
+            print(f"    actives a T+{latency} : {len(active)}/{len(measured)} "
+                  f"({100 * len(active) / len(measured):.1f} %)")
+            print(f"    au-dessus du seuil : {len(above)} "
+                  f"({100 * len(above) / len(measured):.1f} % de la "
+                  f"population mesuree)")
         if not above:
             matrix[latency] = {"actives": len(active), "au_dessus": 0,
                                "horizons": {}}
@@ -860,30 +975,64 @@ def section_4(rows: list[dict]) -> dict:
                 "moyenne_exclus": round(mean_excluded, 3),
                 "moyenne_zero": round(mean_zero, 3),
             }
-            print(f"    {label:>8}{len(returns):>5}{median:>9.2f}"
-                  f"{percentile(returns, 0.75):>8.2f}"
-                  f"{percentile(returns, 0.90):>8.2f}"
-                  f"{wins['>= x2']:>7.1%}{wins['>= x5']:>7.1%}"
-                  f"{wins['>= x10']:>7.1%}{losses:>8.1%}{worst:>8.2f}"
-                  f"{mean_excluded:>8.2f}{mean_zero:>7.2f}")
+            if verbose:
+                print(f"    {label:>8}{len(returns):>5}{median:>9.2f}"
+                      f"{percentile(returns, 0.75):>8.2f}"
+                      f"{percentile(returns, 0.90):>8.2f}"
+                      f"{wins['>= x2']:>7.1%}{wins['>= x5']:>7.1%}"
+                      f"{wins['>= x10']:>7.1%}{losses:>8.1%}{worst:>8.2f}"
+                      f"{mean_excluded:>8.2f}{mean_zero:>7.2f}")
         matrix[latency] = {"actives": len(active), "au_dessus": len(above),
                            "horizons": horizons}
 
-    print("\n  moy.ex = rendement moyen equipondere en EXCLUANT les tokens "
-          "devenus inactifs a l'horizon (biais du survivant).")
-    print("  moy.0  = les memes, comptes a ZERO. La verite est entre les "
-          "deux, aucune des deux ne vaut seule.")
+    if verbose:
+        print("\n  n = effectif de la cellule. moy.ex = rendement moyen "
+              "equipondere en EXCLUANT\n  les tokens devenus inactifs a "
+              "l'horizon (biais du survivant) ; moy.0 les compte a\n  ZERO. "
+              "La verite est entre les deux, aucune des deux ne vaut seule.")
+    return matrix
+
+
+def base_rates(rows: list[dict], labels: tuple[str, ...] | None = None) -> dict:
+    """Part des graduations au-dessus de chaque palier, a un instant mesure."""
+    base: dict[str, Any] = {}
+    if not rows:
+        return base
+    for threshold in BASE_RATE_THRESHOLDS:
+        hits = 0
+        for row in rows:
+            points = (row.get("points") or {})
+            values = [rules.to_float(entry.get("mcap_usd"))
+                      for label, entry in points.items()
+                      if isinstance(entry, dict)
+                      and (labels is None or label in labels)]
+            if values and max(values) >= threshold:
+                hits += 1
+        base[f"{threshold:,.0f}"] = {"tokens": hits,
+                                     "part": round(hits / len(rows), 5)}
+    return base
+
+
+def section_4(rows: list[dict]) -> dict:
+    start_section("4", "La matrice latence x horizon (aucun appel API)")
+    measured = [r for r in rows if (r.get("status") or "mesure") == "mesure"]
+    print(f"  {len(measured)} trajectoire(s) exploitables sur {len(rows)} "
+          f"ligne(s) en base")
+    if not measured:
+        return {"tokens": 0}
+    matrix = compute_matrix(measured)
+    for latency, block in matrix.items():
+        coherent(f"au-dessus <= actives ({latency})",
+                 block["au_dessus"] <= block["actives"],
+                 f"{block['au_dessus']} au-dessus pour {block['actives']} "
+                 f"actives")
 
     print("\n  --- taux de base : capitalisation atteinte a un instant "
           "mesure ---")
-    base: dict[str, Any] = {}
-    for threshold in BASE_RATE_THRESHOLDS:
-        hits = sum(1 for r in measured
-                   if rules.to_float(r.get("mcap_max_usd")) >= threshold)
-        share = hits / len(measured)
-        base[f"{threshold:,.0f}"] = {"tokens": hits, "part": round(share, 5)}
-        print(f"    >= {threshold:>12,.0f} $ : {hits:5d} tokens "
-              f"({share:7.3%})")
+    base = base_rates(measured)
+    for threshold, stats in base.items():
+        print(f"    >= {threshold:>12} $ : {stats['tokens']:5d} tokens "
+              f"({stats['part']:7.3%})")
     return {"tokens": len(measured), "matrice": matrix, "taux_de_base": base}
 
 
@@ -898,7 +1047,9 @@ def show_budget() -> None:
         cost = CREDIT_COST.get(method, 0)
         print(f"  {method:28} : {count:5d} appels -> {count * cost:>8,} "
               f"credits")
-    print(f"  {'TOTAL':28} : {_credits:>8,} / {MAX_CREDITS:,} credits")
+    print(f"  {'TOTAL':28} : {_credits:>8,} credits ce run")
+    print(f"  {'CUMULE sur la fenetre':28} : "
+          f"{_credits + _credits_before:>8,} / {MAX_CREDITS:,} credits")
     print("\nPar section :")
     for section, cost in sorted(_credits_by_section.items()):
         print(f"  section {section:2} : {cost:>8,} credits")
@@ -932,7 +1083,9 @@ def final_recap(results: dict) -> dict:
             "etape1": results.get("2"), "etape2": results.get("3"),
             "matrice": (results.get("4") or {}).get("matrice"),
             "taux_de_base": (results.get("4") or {}).get("taux_de_base"),
-            "credits": _credits, "par_section": dict(_credits_by_section),
+            "credits": _credits, "credits_precedents": _credits_before,
+            "credits_cumules": _credits + _credits_before,
+            "par_section": dict(_credits_by_section),
             "plafond_atteint": _budget_reached,
             "incoherences": list(_incoherences)}
 
@@ -978,7 +1131,7 @@ def load_existing(days: list[str]) -> dict[str, dict]:
 
 
 def main() -> None:
-    global _run_at
+    global _run_at, _credits_before
     setup_logging()
     diagnose_environment()
     present = bool(os.environ.get("HELIUS_API_KEY", "").strip())
@@ -992,7 +1145,8 @@ def main() -> None:
     print(f"  fenetre           : {', '.join(days)} "
           f"(journees completes, echues depuis {MATURITY_DAYS} jours)")
     print(f"  plafond           : {MAX_CREDITS:,} credits")
-    print(f"  seuil d'entree    : {ENTRY_MCAP_USD:,.0f} $")
+    print(f"  seuil d'entree    : x{ENTRY_MULTIPLE:g} depuis la capitalisation a la graduation")
+    print(f"  budget etape 2    : {STAGE2_CREDITS:,} credits, ordre aleatoire")
     print(f"  echantillon etape 1 : {STAGE1_SAMPLE} (seed {RANDOM_SEED})")
     print(f"  ecriture          : {GRAD_PATHS_TABLE}, token par token")
 
@@ -1002,13 +1156,24 @@ def main() -> None:
     expected = 1100 * WINDOW_DAYS * STAGE1_SAMPLE
     print(f"\n  budget previsionnel, a {expected:.0f} graduations attendues :")
     print(f"    etape 1 : {expected * unit1:,.0f} credits "
-          f"({unit1} par token)")
-    print(f"    reste pour l'etape 2 : "
-          f"{max(0, MAX_CREDITS - expected * unit1):,.0f} credits, soit "
-          f"{max(0, MAX_CREDITS - expected * unit1) // unit2:,.0f} token(s) "
-          f"suivis a {unit2} credits")
+          f"({unit1} par token, {len(STAGE1_POINTS)} instants)")
+    print(f"    etape 2 : {STAGE2_CREDITS:,} credits reserves, soit "
+          f"{STAGE2_CREDITS // unit2:,} token(s) a {unit2} credits")
 
     if not check_tables():
+        return
+
+    # Le plafond est CUMULE sur tous les runs de cette fenetre : la
+    # consommation precedente est relue avant de commencer.
+    _credits_before = consumed_before(days)
+    print(f"\n  deja consomme sur cette fenetre : {_credits_before:,} "
+          f"credits -> reste {credits_left():,}")
+    if credits_left() <= 0:
+        log.warning("Plafond cumule deja atteint : rien a faire. Relever "
+                    "MAX_CREDITS pour continuer.")
+        log_run("run", "arret", {"raison": "plafond cumule atteint",
+                                 "jours": days,
+                                 "credits_precedents": _credits_before})
         return
 
     accounts = load_accounts()

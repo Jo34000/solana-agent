@@ -508,3 +508,28 @@ def fetch_grad_paths(days: list[str]) -> list[dict]:
     log.info("Supabase : %d trajectoire(s) deja en base sur %d journee(s)",
              len(rows), len(days))
     return rows
+
+
+def fetch_all_grad_paths() -> list[dict]:
+    """Toutes les trajectoires, pour un calcul hors ligne."""
+    rows: list[dict] = []
+    start = 0
+    while True:
+        response = (
+            get_client()
+            .table(GRAD_PATHS_TABLE)
+            .select("mint, pool, signature, signer, grad_at, jour, status, "
+                    "stage, supply, points, mcap_max_usd, points_actifs, "
+                    "points_mesures")
+            .order("grad_at")
+            .range(start, start + _PAGE_SIZE - 1)
+            .execute()
+        )
+        page = response.data or []
+        rows += page
+        if len(page) < _PAGE_SIZE:
+            break
+        start += _PAGE_SIZE
+    log.info("Supabase : %d trajectoire(s) relues dans %s",
+             len(rows), GRAD_PATHS_TABLE)
+    return rows

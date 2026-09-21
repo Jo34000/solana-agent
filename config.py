@@ -163,6 +163,8 @@ EARLY_BUYS_TABLE = "sol_early_buys"
 SMART_WALLETS_TABLE = "sol_smart_wallets"
 # Journal des runs : la seule table qu'une sonde a le droit d'ecrire.
 RUN_LOG_TABLE = "sol_run_log"
+# Trajectoires des graduations, ecrites par les experiences.
+GRAD_PATHS_TABLE = "sol_grad_paths"
 
 # Seuil de performance a partir duquel un token compte comme gagnant dans le
 # backtest (x2 sur le prix d'entree).

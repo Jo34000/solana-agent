@@ -36,6 +36,8 @@ Ce repo est construit par briques.
 | `probe_universe_v5.py` | Sonde jetable : regle d'adresse de cotation, criblage a 3 points |
 | `probe_universe_v6.py` | Sonde jetable : mint et pool depuis la transaction brute, regle **validee** |
 | `probe_universe_v7.py` | Sonde jetable : liste reparee, graduation definie sans le signataire |
+| `graduations.py` | **Regles validees** : ou est le pool, qu'est-ce qu'une graduation, prix median |
+| `exp1_window.py` | **Experience 1** : la fenetre exploitable, ecrite dans `sol_grad_paths` |
 | `solana_addr.py` | base58 et derivation de PDA, sans dependance externe |
 
 ## Installation
@@ -51,12 +53,16 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7` |
+| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7`, `exp1_window` |
 | `FORCE_REMEASURE` | `true` pour refaire une mesure deja faite (voir plus bas) |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
 | `SUPABASE_URL` | URL du projet Supabase |
 | `SUPABASE_KEY` | Cle Supabase avec droit d'ecriture sur les tables `sol_*` |
+| `WINDOW_DAYS` | **Optionnelle**, `exp1_window` : journees completes mesurees (defaut **3**) |
+| `MAX_CREDITS` | **Optionnelle**, `exp1_window` : plafond de credits Helius (defaut **130 000**) |
+| `ENTRY_MCAP_USD` | **Optionnelle**, `exp1_window` : seuil d'entree en etape 2 (defaut **60 000 $**) |
+| `STAGE1_SAMPLE` | **Optionnelle**, `exp1_window` : fraction des graduations mesurees en etape 1 (defaut **1.0**) |
 | `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v7` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
 
 En local, un fichier `.env` (git-ignore) suffit. Au demarrage, chaque variable
@@ -85,6 +91,7 @@ RUN_MODE=probe_universe_v4 python main.py # sonde univers v4, liste datee
 RUN_MODE=probe_universe_v5 python main.py # sonde univers v5, adresse de cotation
 RUN_MODE=probe_universe_v6 python main.py # sonde univers v6, pool valide
 RUN_MODE=probe_universe_v7 python main.py # sonde univers v7, liste reparee
+RUN_MODE=exp1_window python main.py  # experience 1, fenetre exploitable
 ```
 
 | `RUN_MODE` | Effet |
@@ -105,6 +112,7 @@ RUN_MODE=probe_universe_v7 python main.py # sonde univers v7, liste reparee
 | `probe_universe_v5` | sonde univers v5, relit la liste datee de la v4 |
 | `probe_universe_v6` | sonde univers v6, regle validee avant usage |
 | `probe_universe_v7` | sonde univers v7, liste reparee et graduation definie |
+| `exp1_window` | **experience 1** : ecrit des resultats dans `sol_grad_paths` |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -619,6 +627,94 @@ susceptibles d'etre fermees.
 Colonnes supplementaires sur `sol_smart_wallets` : `positions_fermees`,
 `positions_ouvertes`, `win_rate_reel`, `median_pnl_x`, `median_gagnant_x`,
 `median_perdant_x`, `sol_investi`, `sol_recupere`, `pnl_global_x`.
+
+## L'experience 1 : `RUN_MODE=exp1_window`
+
+**Ce n'est plus une sonde.** Les resultats sont ecrits dans
+`sol_grad_paths`, **token par token, au fil de l'eau** : un arret au
+plafond de credits ne perd rien de ce qui precede, et une relance **saute
+les mints deja presents**.
+
+Question posee : un humain alerte avec **5, 15 ou 60 minutes** de latence
+dispose-t-il d'une fenetre exploitable ? La reponse est une **matrice**
+latence x horizon, pas une opinion.
+
+### La table
+
+```sql
+create table if not exists sol_grad_paths (
+  mint           text primary key,
+  pool           text,
+  signature      text,
+  signer         text,
+  grad_at        timestamptz,
+  jour           date,
+  status         text,
+  stage          int,
+  supply         numeric,
+  points         jsonb,
+  mcap_max_usd   numeric,
+  points_actifs  int,
+  points_mesures int,
+  updated_at     timestamptz default now()
+);
+```
+
+L'ecriture est **testee au demarrage**, avant la moindre depense : table
+absente, l'experience affiche ce SQL et s'arrete.
+
+### Inactif n'est pas perdu, et perdu n'est pas inactif
+
+Un token sans echange autour d'un instant est **inactif** a cet instant :
+son point vaut `null` avec `actif = false`, et **c'est une mesure**. Une
+**PERTE** d'appel n'en est pas une : elle est enregistree comme telle et
+jamais confondue avec une absence d'acheteur — sans quoi la matrice
+compterait des silences d'API comme des tokens sans marche.
+
+### Les deux etapes
+
+| Etape | Qui | Instants | Cout |
+| --- | --- | --- | --- |
+| 1 | **toutes** les graduations de la fenetre | +5 min, +15 min, +60 min | 31 credits/token |
+| 2 | celles qui depassent `ENTRY_MCAP_USD` a l'un des trois | +2 h, +3 h, +6 h, +12 h, +24 h, +3 j, +7 j | 70 credits/token |
+
+La fenetre est faite de **journees completes echues depuis 8 jours** :
+l'horizon a 7 jours doit etre mature, sinon il ne mesure rien. Le budget
+previsionnel est **affiche au demarrage**, avant la premiere depense.
+
+### La matrice
+
+Pour chaque latence, et pour chaque horizon au-dela :
+mediane, p75, p90 du rendement `P(horizon) / P(latence)`, parts `>= x2`,
+`>= x5`, `>= x10` et `<= x0.3`, **pire creux avant l'horizon**, et le
+rendement moyen equipondere du benchmark naif.
+
+Ce dernier est donne en **deux versions** : `moy.ex` exclut les tokens
+devenus inactifs a l'horizon (**biais du survivant**, celui-la meme qui
+avait fausse la phase 3), `moy.0` les compte a **zero**. La verite est
+entre les deux, et **aucune des deux n'est presentee seule**.
+
+S'y ajoutent les **taux de base** : part des graduations dont la
+capitalisation depasse 100 k$, 1 M$ et 5 M$ a un instant mesure.
+
+### `graduations.py`
+
+Les regles validees par les sondes sortent des fichiers jetables : une
+experience ne doit pas dependre d'une sonde. Le module ne fait **aucun
+appel reseau**, il ne lit que des payloads — pool, graduation, signature
+(qui n'est **pas** a la racine), prix median d'une page.
+
+### Deux ecarts signales avant de coder
+
+1. **« Sans appel si possible »** vaut pour la premiere verification, pas
+   pour la seconde. Les 1 181 signatures de `39azUYFW` se **reconstituent
+   exactement** (857 propres de la v6 + 324 connues de la v4), et le total
+   est verifie contre le nombre ecrit par la v6. En revanche les 48
+   transactions `pool_absent` n'existent qu'en **compte** dans la v7 : les
+   croiser avec les 48 frais a 0,0150 SOL demande **un** appel, a 100
+   credits.
+2. **Le schema de `sol_grad_paths` n'etait pas specifie** : il est defini
+   dans `supabase_client.py`, rappele ici, et teste au demarrage.
 
 ## La sonde `RUN_MODE=probe_universe_v7`
 

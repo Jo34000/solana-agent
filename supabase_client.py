@@ -81,6 +81,42 @@ Colonnes attendues sur sol_run_log, journal des sondes :
 C'est la SEULE table qu'une sonde ecrit. Elle existe parce qu'une sonde qui
 n'ecrit rien perd ses acquis : le 20/09, les comptes recurrents trouves
 n'etaient plus nulle part au ticket suivant.
+
+Colonnes attendues sur sol_grad_paths, trajectoires des graduations :
+    mint           text  (cle primaire)
+    pool           text  (owner valide par la regle des sondes)
+    signature      text
+    signer         text  (feePayer de la migration)
+    grad_at        timestamptz
+    jour           date
+    status         text  (mesure, variante_non_couverte, ...)
+    stage          int   (1 = trois premiers instants, 2 = trajectoire)
+    supply         numeric
+    points         jsonb (par instant : prix_sol, mcap_usd, actif)
+    mcap_max_usd   numeric
+    points_actifs  int
+    points_mesures int
+    updated_at     timestamptz
+
+    create table if not exists sol_grad_paths (
+      mint           text primary key,
+      pool           text,
+      signature      text,
+      signer         text,
+      grad_at        timestamptz,
+      jour           date,
+      status         text,
+      stage          int,
+      supply         numeric,
+      points         jsonb,
+      mcap_max_usd   numeric,
+      points_actifs  int,
+      points_mesures int,
+      updated_at     timestamptz default now()
+    );
+
+Un token sans echange autour d'un instant n'est pas une perte : son point
+vaut null avec actif = false. C'est une mesure, et elle compte.
 """
 
 from __future__ import annotations
@@ -94,6 +130,7 @@ from supabase import Client, create_client
 from config import (
     ANALYZED_TABLE,
     EARLY_BUYS_TABLE,
+    GRAD_PATHS_TABLE,
     RUN_LOG_TABLE,
     SMART_WALLETS_TABLE,
 )
@@ -418,4 +455,56 @@ def fetch_run_log(run_mode: str, section: str, limit: int = 5) -> list[dict]:
     rows = response.data or []
     log.info("Supabase : %d ligne(s) relues dans %s (%s / section %s)",
              len(rows), RUN_LOG_TABLE, run_mode, section)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Trajectoires des graduations
+# ---------------------------------------------------------------------------
+
+
+def upsert_grad_path(row: dict) -> None:
+    """Ecrit UNE trajectoire. Leve si la base ne confirme rien.
+
+    L'ecriture est faite token par token, au fil de l'eau : un arret au
+    plafond de credits ne perd rien de ce qui precede.
+    """
+    response = (
+        get_client()
+        .table(GRAD_PATHS_TABLE)
+        .upsert(row, on_conflict="mint")
+        .execute()
+    )
+    if not (response.data or []):
+        raise RuntimeError(
+            f"Ecriture non confirmee dans {GRAD_PATHS_TABLE} pour "
+            f"{row.get('mint')} : verifier que la table existe et ses "
+            f"policies RLS."
+        )
+
+
+def fetch_grad_paths(days: list[str]) -> list[dict]:
+    """Toutes les lignes deja ecrites pour ces journees."""
+    if not days:
+        return []
+    rows: list[dict] = []
+    start = 0
+    while True:
+        response = (
+            get_client()
+            .table(GRAD_PATHS_TABLE)
+            .select("mint, pool, signature, signer, grad_at, jour, status, "
+                    "stage, supply, points, mcap_max_usd, points_actifs, "
+                    "points_mesures")
+            .in_("jour", days)
+            .range(start, start + _PAGE_SIZE - 1)
+            .execute()
+        )
+        page = response.data or []
+        rows += page
+        if len(page) < _PAGE_SIZE:
+            break
+        start += _PAGE_SIZE
+    log.info("Supabase : %d trajectoire(s) deja en base sur %d journee(s)",
+             len(rows), len(days))
     return rows

@@ -20,6 +20,8 @@ variable d'environnement RUN_MODE.
     RUN_MODE=probe_universe_v6     -> sonde univers v6 (pool valide)
     RUN_MODE=probe_universe_v7     -> sonde univers v7 (liste reparee)
 
+    RUN_MODE=exp1_window           -> experience 1 : fenetre exploitable
+
 Start Command Railway : python main.py
 """
 
@@ -39,6 +41,7 @@ RUN_MODES = (
     "probe", "probe_helius", "probe_transfers", "probe_universe",
     "probe_universe_v2", "probe_universe_v3", "probe_universe_v4",
     "probe_universe_v5", "probe_universe_v6", "probe_universe_v7",
+    "exp1_window",
 )
 
 # Defaut volontairement INERTE : chaque deploiement ou redemarrage de
@@ -98,6 +101,13 @@ def main() -> int:
             ", ".join(m for m in RUN_MODES if m != "idle"),
         )
         log.info("Fin de run (idle).")
+        return 0
+
+    if mode == "exp1_window":
+        import exp1_window
+
+        exp1_window.main()
+        log.info("Fin de run (%s).", mode)
         return 0
 
     if mode == "probe_universe_v7":

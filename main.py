@@ -17,6 +17,7 @@ variable d'environnement RUN_MODE.
     RUN_MODE=probe_universe_v3     -> sonde univers v3 (mints d'une journee)
     RUN_MODE=probe_universe_v4     -> sonde univers v4 (liste datee)
     RUN_MODE=probe_universe_v5     -> sonde univers v5 (adresse de cotation)
+    RUN_MODE=probe_universe_v6     -> sonde univers v6 (pool valide)
 
 Start Command Railway : python main.py
 """
@@ -36,7 +37,7 @@ RUN_MODES = (
     "winners", "discovery", "validation", "validation_v2", "validation_v3",
     "probe", "probe_helius", "probe_transfers", "probe_universe",
     "probe_universe_v2", "probe_universe_v3", "probe_universe_v4",
-    "probe_universe_v5",
+    "probe_universe_v5", "probe_universe_v6",
 )
 
 # Defaut volontairement INERTE : chaque deploiement ou redemarrage de
@@ -96,6 +97,13 @@ def main() -> int:
             ", ".join(m for m in RUN_MODES if m != "idle"),
         )
         log.info("Fin de run (idle).")
+        return 0
+
+    if mode == "probe_universe_v6":
+        import probe_universe_v6
+
+        probe_universe_v6.main()
+        log.info("Fin de run (%s).", mode)
         return 0
 
     if mode == "probe_universe_v5":

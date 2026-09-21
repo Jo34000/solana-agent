@@ -34,6 +34,7 @@ Ce repo est construit par briques.
 | `probe_universe_v3.py` | Sonde jetable : mints d'une journee de graduations, prix des tokens morts |
 | `probe_universe_v4.py` | Sonde jetable : liste datee des graduations, jointure par signature |
 | `probe_universe_v5.py` | Sonde jetable : regle d'adresse de cotation, criblage a 3 points |
+| `probe_universe_v6.py` | Sonde jetable : mint et pool depuis la transaction brute, regle **validee** |
 | `solana_addr.py` | base58 et derivation de PDA, sans dependance externe |
 
 ## Installation
@@ -49,13 +50,13 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5` |
+| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6` |
 | `FORCE_REMEASURE` | `true` pour refaire une mesure deja faite (voir plus bas) |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
 | `SUPABASE_URL` | URL du projet Supabase |
 | `SUPABASE_KEY` | Cle Supabase avec droit d'ecriture sur les tables `sol_*` |
-| `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v5` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
+| `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v6` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
 
 En local, un fichier `.env` (git-ignore) suffit. Au demarrage, chaque variable
 est loguee `presente` ou `ABSENTE`, et la source est annoncee explicitement :
@@ -81,6 +82,7 @@ RUN_MODE=probe_universe_v2 python main.py # sonde univers v2, courbe derivee
 RUN_MODE=probe_universe_v3 python main.py # sonde univers v3, mints d'une journee
 RUN_MODE=probe_universe_v4 python main.py # sonde univers v4, liste datee
 RUN_MODE=probe_universe_v5 python main.py # sonde univers v5, adresse de cotation
+RUN_MODE=probe_universe_v6 python main.py # sonde univers v6, pool valide
 ```
 
 | `RUN_MODE` | Effet |
@@ -99,6 +101,7 @@ RUN_MODE=probe_universe_v5 python main.py # sonde univers v5, adresse de cotatio
 | `probe_universe_v3` | sonde univers v3, ecrit dans `sol_run_log` uniquement |
 | `probe_universe_v4` | sonde univers v4, **relit** `sol_run_log` et y ecrit |
 | `probe_universe_v5` | sonde univers v5, relit la liste datee de la v4 |
+| `probe_universe_v6` | sonde univers v6, regle validee avant usage |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -613,6 +616,79 @@ susceptibles d'etre fermees.
 Colonnes supplementaires sur `sol_smart_wallets` : `positions_fermees`,
 `positions_ouvertes`, `win_rate_reel`, `median_pnl_x`, `median_gagnant_x`,
 `median_perdant_x`, `sol_investi`, `sol_recupere`, `pnl_global_x`.
+
+## La sonde `RUN_MODE=probe_universe_v6`
+
+Le run de 05:51 a trouve **un** pool qui rend des swaps, et compte **1 181
+signatures** sur `39azUYFW` le 17/09 dont **857 absentes** de `9C4nRvhh`.
+La v6 en tire une regle, la **valide**, puis s'en sert — ou s'arrete.
+
+### Trois regles de conduite
+
+1. **Une regle deduite est validee avant d'etre appliquee**, sur les cas
+   dont on connait deja la reponse. Le taux de validation est affiche.
+2. **Toute conclusion imprimee est verifiee contre ses propres nombres.**
+   Une conclusion qui les contredit s'affiche `INCOHERENT` et **n'est pas
+   reutilisee** plus loin. Le recapitulatif les liste toutes.
+3. **Une section qui depend d'une regle non validee s'arrete.**
+
+### La regle mint + pool
+
+Sur chaque transaction brute (`getTransactionsForAddress` en `full`), les
+soldes `meta.preTokenBalances` et `meta.postTokenBalances` sont compares
+par compte :
+
+- le **mint gradue** est celui, hors SOL / WSOL / stablecoins, dont un
+  compte voit son solde **augmenter** ;
+- le **pool** est le `owner` qui voit augmenter **a la fois** un compte de
+  ce mint **et** un compte WSOL. Un seul owner doit remplir les deux
+  conditions, et les transactions a 0, 1 ou plusieurs candidats sont
+  comptees.
+
+La meme logique mint / owner / signe est ensuite appliquee, **au format
+Enhanced** (`accountData.tokenBalanceChanges`), aux migrations des 10
+tokens de `sol_analyzed_tokens` dont `pool_address` est connu : le pool
+trouve doit etre **egal** a celui de la base. **En dessous de 9/10, les
+sections C et D s'arretent.**
+
+### Les quatre sections
+
+| # | Mesure |
+| --- | --- |
+| A | La regle ci-dessus, sa validation 10/10, et la concordance des mints avec la liste Enhanced de la v4. |
+| B | **Que sont les 857 signatures propres a `39azUYFW` ?** 100 tirees au hasard, un appel Enhanced, distribution `type` / `source`, `feePayer` des `CREATE_POOL` / `PUMP_AMM`. Sortie : le **nombre reel de graduations** du 17/09, avec son **intervalle de confiance a 95 %** (score de Wilson, sans dependance). |
+| C | 30 mints tires dans la liste de A, trajectoire 8 points sur le **pool valide**, taux de succes du prix par classe, distribution des capitalisations. |
+| D | Criblages a **1 point** (+6 h), **2 points** (+1 h, +24 h) et **3 points** (+30 min, +6 h, +24 h) compares a la trajectoire complete : manques et retenus a tort par seuil. Budget mensuel de chaque variante, sur toute la population **et sur la moitie tiree au hasard**. |
+
+Chaque variante de criblage est un **sous-ensemble** des 8 points : sa
+capitalisation vue ne peut pas depasser celle de la trajectoire complete,
+et un « retenu a tort » est donc impossible. C'est verifie a chaque ligne,
+et une violation s'affiche `INCOHERENT`.
+
+### Ce que la sonde ne paie pas
+
+La section D est gratuite : ses points sont deja lus par la section C. Les
+adresses des comptes et la liste datee de la v4 sont relues dans
+`sol_run_log`.
+
+### Deux ecarts signales avant de coder
+
+1. **Les 857 signatures ne sont pas persistees** : la v5 n'a ecrit que
+   leurs nombres. La journee de `39azUYFW` est donc re-scannee (environ
+   250 credits), et **cette fois la liste part dans `sol_run_log`**.
+2. **`meta.preTokenBalances` n'est pas garanti** dans la reponse `full` :
+   si le champ manque, la sonde affiche le **premier element brut** et
+   s'arrete la, au lieu de conclure sur du vide.
+
+### Plafonds
+
+```
+getTransfersByAddress <= 400   getTransactionsForAddress <=  5
+Enhanced (voie C)     <=   6   CoinGecko                 <=  5
+```
+
+Une seule page de bougies horaires suffit ici : 41 jours de couverture
+pour un echantillon vieux de 4 jours.
 
 ## La sonde `RUN_MODE=probe_universe_v5`
 

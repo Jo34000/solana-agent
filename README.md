@@ -35,6 +35,7 @@ Ce repo est construit par briques.
 | `probe_universe_v4.py` | Sonde jetable : liste datee des graduations, jointure par signature |
 | `probe_universe_v5.py` | Sonde jetable : regle d'adresse de cotation, criblage a 3 points |
 | `probe_universe_v6.py` | Sonde jetable : mint et pool depuis la transaction brute, regle **validee** |
+| `probe_universe_v7.py` | Sonde jetable : liste reparee, graduation definie sans le signataire |
 | `solana_addr.py` | base58 et derivation de PDA, sans dependance externe |
 
 ## Installation
@@ -50,13 +51,13 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6` |
+| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7` |
 | `FORCE_REMEASURE` | `true` pour refaire une mesure deja faite (voir plus bas) |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
 | `SUPABASE_URL` | URL du projet Supabase |
 | `SUPABASE_KEY` | Cle Supabase avec droit d'ecriture sur les tables `sol_*` |
-| `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v6` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
+| `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v7` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
 
 En local, un fichier `.env` (git-ignore) suffit. Au demarrage, chaque variable
 est loguee `presente` ou `ABSENTE`, et la source est annoncee explicitement :
@@ -83,6 +84,7 @@ RUN_MODE=probe_universe_v3 python main.py # sonde univers v3, mints d'une journe
 RUN_MODE=probe_universe_v4 python main.py # sonde univers v4, liste datee
 RUN_MODE=probe_universe_v5 python main.py # sonde univers v5, adresse de cotation
 RUN_MODE=probe_universe_v6 python main.py # sonde univers v6, pool valide
+RUN_MODE=probe_universe_v7 python main.py # sonde univers v7, liste reparee
 ```
 
 | `RUN_MODE` | Effet |
@@ -102,6 +104,7 @@ RUN_MODE=probe_universe_v6 python main.py # sonde univers v6, pool valide
 | `probe_universe_v4` | sonde univers v4, **relit** `sol_run_log` et y ecrit |
 | `probe_universe_v5` | sonde univers v5, relit la liste datee de la v4 |
 | `probe_universe_v6` | sonde univers v6, regle validee avant usage |
+| `probe_universe_v7` | sonde univers v7, liste reparee et graduation definie |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -616,6 +619,85 @@ susceptibles d'etre fermees.
 Colonnes supplementaires sur `sol_smart_wallets` : `positions_fermees`,
 `positions_ouvertes`, `win_rate_reel`, `median_pnl_x`, `median_gagnant_x`,
 `median_perdant_x`, `sol_investi`, `sol_recupere`, `pnl_global_x`.
+
+## La sonde `RUN_MODE=probe_universe_v7`
+
+### Ce qui avait reellement arrete la v6
+
+Le run de 10:08 s'est arrete apres une validation a **9/10**, et le seuil
+a ete soupconne. **Il n'etait pas en cause** : la v6 teste
+`exact >= VALIDATION_MIN` avec `VALIDATION_MIN = 9`, donc 9/10 validait
+deja — la reproduction le confirme. Ce qui a ferme la suite, c'est la
+**garde de coherence** « regle validee mais aucun pool trouve » : la liste
+etait **vide** malgre **476** transactions a un pool unique, parce que
+l'entree exigeait `isinstance(row["signature"], str)` et que la signature
+**n'est pas a la racine** de la ligne brute.
+
+La garde a donc fait exactement son travail — elle a refuse de laisser
+passer une conclusion que les nombres contredisaient. C'est
+l'**extraction** qui etait fausse, et c'est elle que la v7 repare.
+
+### Section A : l'entonnoir d'extraction
+
+Pour 3 transactions a un pool unique, la sonde affiche **chaque champ**
+(cles de premier niveau, signature et son chemin, `blockTime` et son
+chemin, mint, pool) et nomme l'etape ou l'entree disparait. La signature
+est ensuite cherchee a quatre emplacements (`signature`,
+`transaction.signatures[0]`, `transaction.signature`, `signatures[0]`), et
+le chemin reellement utilise est logue.
+
+L'entonnoir compte alors chaque perte par motif — `aucun_mint`,
+`pool_absent`, `pools_multiples`, `signature_introuvable`,
+`horodatage_introuvable`, `retenue` — avec l'invariant
+« somme des motifs = transactions lues ».
+
+La regle est **revalidee en format BRUT** (`getTransaction`), et non plus
+seulement en format Enhanced : les 10 migrations connues doivent rendre
+leur `pool_address`. Seuil **>= 9/10**, ecrit et logue comme tel.
+
+### Section B : une graduation, sans regarder qui signe
+
+> **Graduation** = `CREATE_POOL` dans lequel le compte de la **bonding
+> curve** du mint (PDA `["bonding-curve", mint]`) voit son solde de ce
+> mint **DIMINUER**.
+
+Cette definition ne depend pas du signataire — ce qui compte, c'est que la
+courbe cede ses tokens. Elle est appliquee aux entrees de la section A,
+puis a **100 signatures tirees** parmi les 857 propres a `39azUYFW`, qui
+se repartissent en quatre classes :
+
+| Classe | Sens |
+| --- | --- |
+| (a) | migration deja dans la liste A |
+| (a') | signee par le compte de frais **mais absente de A** — un trou d'extraction |
+| (b) | migration signee par un **autre** compte, dont la liste est affichee |
+| (c) | `CREATE_POOL` **sans** courbe : creation directe, pas une graduation |
+
+Seules (b) et (a') s'ajoutent au total, et l'estimation sort avec son
+**intervalle a 95 %**. `CATE` et `Martians` sont diagnostiques nommement :
+qui les a signees, et leur courbe cede-t-elle bien ses tokens.
+
+La sortie nomme les **comptes a lire pour etre complet**.
+
+### Ce que la sonde ne paie pas
+
+Les **857 signatures propres sont relues** dans `sol_run_log` (la v6 les y
+a ecrites). Les transactions brutes des 10 tokens, recuperees pour la
+validation, resservent au diagnostic de `CATE` et `Martians`. Les
+criblages a 1, 2 et 3 points sont rejoues sur les points deja lus.
+
+### Plafonds
+
+```
+getTransfersByAddress <= 400   getTransactionsForAddress <=  5
+Enhanced (voie C)     <=   4   getTransaction            <= 30
+CoinGecko             <=   5
+```
+
+`getTransaction` n'a pas de cout publie a cote des methodes Helius : la
+facturation annonce **1 credit** pour un appel RPC standard et **10** pour
+une lecture **archivale**. La sonde compte **10** par prudence — 30 appels
+font 300 credits dans les deux cas.
 
 ## La sonde `RUN_MODE=probe_universe_v6`
 

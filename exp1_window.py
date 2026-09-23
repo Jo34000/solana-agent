@@ -105,6 +105,10 @@ CHECKPOINT_EVERY = 100
 # echu : 7 jours, plus une marge d'un jour.
 MATURITY_DAYS = 8
 
+# UNE definition de l'activite : un swap dans +/- 10 minutes de l'instant
+# vise, la meme a tous les horizons.
+ACTIVITY_WINDOW = _env_int("ACTIVITY_WINDOW_S", 600)
+
 # "grad" est le prix des premiers swaps qui suivent la migration : c'est
 # la reference du seuil d'entree, pas une latence.
 GRAD_POINT = "grad"
@@ -368,12 +372,18 @@ CREATE_SQL = """create table if not exists sol_grad_paths (
   status         text,
   stage          int,
   supply         numeric,
+  decimals       int,
+  supply_raw     numeric,
   points         jsonb,
   mcap_max_usd   numeric,
   points_actifs  int,
   points_mesures int,
   updated_at     timestamptz default now()
-);"""
+);
+
+-- Table deja creee sans les unites ? Les deux colonnes suffisent :
+alter table sol_grad_paths add column if not exists decimals   int;
+alter table sol_grad_paths add column if not exists supply_raw numeric;"""
 
 
 def check_tables() -> bool:
@@ -387,9 +397,12 @@ def check_tables() -> bool:
         print(f"\n{RUN_LOG_TABLE} inutilisable : {error}")
         return False
     try:
+        # La ligne de test porte TOUTES les colonnes ecrites ensuite :
+        # une colonne manquante se decouvre ici, pas apres 100 000 credits.
         db.upsert_grad_path({
             "mint": "__probe__", "status": "test_ecriture", "stage": 0,
-            "points": {}, "updated_at": datetime.now(timezone.utc).isoformat(),
+            "points": {}, "decimals": 0, "supply_raw": 0,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         })
     except Exception as error:               # noqa: BLE001
         print(f"\n{GRAD_PATHS_TABLE} inutilisable : {error}")
@@ -461,13 +474,13 @@ def sol_price_at(moment: float) -> float | None:
     return None
 
 
-def tolerance_for(delta: float) -> float:
-    return max(900.0, delta * 0.25)
+def price_at(pool: str, moment: float) -> tuple[float | None, str, float]:
+    """(prix en SOL, etat, ecart au temps vise). etat : actif, inactif,
+    perte ou plafond.
 
-
-def price_at(pool: str, moment: float,
-             delta: float) -> tuple[float | None, str]:
-    """(prix en SOL, etat). etat : actif, inactif, perte ou plafond.
+    La fenetre est FIXE : +/- ACTIVITY_WINDOW secondes, la meme a tous
+    les horizons. L'ancienne tolerance proportionnelle acceptait un swap
+    42 heures apres l'instant vise a 7 jours et appelait cela "actif".
 
     INACTIF et PERTE ne sont pas la meme chose : le premier est une
     mesure, le second un silence de l'API, et il n'est jamais enregistre
@@ -475,15 +488,16 @@ def price_at(pool: str, moment: float,
     """
     payload = transfers(pool, {
         "limit": 100, "sortOrder": "asc",
-        "filters": {"blockTime": {"gte": int(moment)}},
+        "filters": {"blockTime": {"gte": int(moment - ACTIVITY_WINDOW)}},
     })
     if payload == "CAPPED":
-        return None, "plafond"
+        return None, "plafond", 0.0
     rows = rows_of(payload)
     if rows is None:
-        return None, "perte"
-    price, _ = rules.median_swap_price(rows, moment, tolerance_for(delta))
-    return (price, "actif") if price is not None else (None, "inactif")
+        return None, "perte", 0.0
+    price, _, gap = rules.median_swap_price(rows, moment, ACTIVITY_WINDOW)
+    return ((price, "actif", gap) if price is not None
+            else (None, "inactif", 0.0))
 
 
 # ---------------------------------------------------------------------------
@@ -693,14 +707,20 @@ def measure_points(record: dict, points: tuple[tuple[str, int], ...],
     pool = record["pool"]
     graduated = rules.to_float(record["grad_at"])
     for label, delta in points:
-        price, state = price_at(pool, graduated + delta, float(delta))
+        moment = graduated + delta
+        price, state, gap = price_at(pool, moment)
         if state == "plafond":
             return measured, True
         entry: dict[str, Any] = {"actif": state == "actif",
                                  "prix_sol": price, "etat": state}
+        if state == "actif":
+            entry["ecart_s"] = round(gap)
         if price is not None and supply > 0:
-            usd = sol_price_at(graduated + delta)
+            usd = sol_price_at(moment)
             if usd:
+                # Le taux est enregistre : une capitalisation se recalcule
+                # alors hors ligne, sans le redemander a personne.
+                entry["sol_usd"] = usd
                 entry["mcap_usd"] = price * usd * supply
         measured[label] = entry
     return measured, False
@@ -714,6 +734,8 @@ def row_from(record: dict, points: dict, supply: float, stage: int) -> dict:
         "grad_at": _iso(rules.to_float(record["grad_at"])),
         "jour": record["jour"], "status": "mesure", "stage": stage,
         "supply": supply or None, "points": points,
+        "decimals": record.get("decimals"),
+        "supply_raw": record.get("supply_raw"),
         "mcap_max_usd": max(mcaps) if mcaps else None,
         "points_actifs": sum(1 for p in points.values() if p.get("actif")),
         "points_mesures": sum(1 for p in points.values()
@@ -742,13 +764,17 @@ def section_2(universe: list[dict], existing: dict[str, dict],
 
     written = 0
     states: Counter = Counter()
+    supplies_absentes: dict[str, bool] = {}
     stopped = "termine"
     for record in todo:
         if not can_spend("getTransfersByAddress"):
             stopped = "plafond de credits"
             break
-        supply = rules.to_float((token_supply(record["mint"]) or {})
-                                .get("uiAmount"))
+        supply, decimals, raw = rules.supply_of(token_supply(record["mint"]))
+        if not supply:
+            supplies_absentes[record["mint"]] = True
+        record["decimals"] = decimals
+        record["supply_raw"] = raw
         points, capped = measure_points(record, STAGE1_POINTS, supply)
         for entry in points.values():
             states[entry["etat"]] += 1
@@ -768,12 +794,16 @@ def section_2(universe: list[dict], existing: dict[str, dict],
     checkpoint("1", written)
     print(f"\n  {written} trajectoires ecrites ({stopped})")
     print(f"  etats des points : {dict(states)}")
+    if supplies_absentes:
+        log.warning("%d token(s) sans supply lisible : leur capitalisation "
+                    "restera absente, jamais nulle", len(supplies_absentes))
     if states["perte"]:
         log.warning("%d point(s) en PERTE : ce ne sont PAS des tokens "
                     "inactifs, ils sont enregistres comme perte",
                     states["perte"])
     return {"a_mesurer": len(todo), "ecrites": written,
-            "etats": dict(states), "arret": stopped}
+            "etats": dict(states), "arret": stopped,
+            "supplies_absentes": len(supplies_absentes)}
 
 
 def reference_mcap(row: dict) -> tuple[float, str]:

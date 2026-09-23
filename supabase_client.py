@@ -90,9 +90,12 @@ Colonnes attendues sur sol_grad_paths, trajectoires des graduations :
     grad_at        timestamptz
     jour           date
     status         text  (mesure, variante_non_couverte, ...)
-    stage          int   (1 = trois premiers instants, 2 = trajectoire)
-    supply         numeric
-    points         jsonb (par instant : prix_sol, mcap_usd, actif)
+    stage          int   (1 = premiers instants, 2 = trajectoire complete)
+    supply         numeric (unites AFFICHEES, decimales appliquees)
+    decimals       int
+    supply_raw     numeric (unites brutes, avant decimales)
+    points         jsonb (par instant : prix_sol, mcap_usd, actif, ecart_s,
+                          sol_usd)
     mcap_max_usd   numeric
     points_actifs  int
     points_mesures int
@@ -108,6 +111,8 @@ Colonnes attendues sur sol_grad_paths, trajectoires des graduations :
       status         text,
       stage          int,
       supply         numeric,
+      decimals       int,
+      supply_raw     numeric,
       points         jsonb,
       mcap_max_usd   numeric,
       points_actifs  int,
@@ -494,8 +499,8 @@ def fetch_grad_paths(days: list[str]) -> list[dict]:
             get_client()
             .table(GRAD_PATHS_TABLE)
             .select("mint, pool, signature, signer, grad_at, jour, status, "
-                    "stage, supply, points, mcap_max_usd, points_actifs, "
-                    "points_mesures")
+                    "stage, supply, decimals, supply_raw, points, "
+                    "mcap_max_usd, points_actifs, points_mesures")
             .in_("jour", days)
             .range(start, start + _PAGE_SIZE - 1)
             .execute()
@@ -519,8 +524,8 @@ def fetch_all_grad_paths() -> list[dict]:
             get_client()
             .table(GRAD_PATHS_TABLE)
             .select("mint, pool, signature, signer, grad_at, jour, status, "
-                    "stage, supply, points, mcap_max_usd, points_actifs, "
-                    "points_mesures")
+                    "stage, supply, decimals, supply_raw, points, "
+                    "mcap_max_usd, points_actifs, points_mesures")
             .order("grad_at")
             .range(start, start + _PAGE_SIZE - 1)
             .execute()

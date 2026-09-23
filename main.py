@@ -22,6 +22,7 @@ variable d'environnement RUN_MODE.
 
     RUN_MODE=exp1_window           -> experience 1 : fenetre exploitable
     RUN_MODE=exp1_matrix           -> experience 1 : matrice, AUCUN appel API
+    RUN_MODE=exp1_matrix_v2        -> experience 1 : unites corrigees, lecture fine
 
 Start Command Railway : python main.py
 """
@@ -42,7 +43,7 @@ RUN_MODES = (
     "probe", "probe_helius", "probe_transfers", "probe_universe",
     "probe_universe_v2", "probe_universe_v3", "probe_universe_v4",
     "probe_universe_v5", "probe_universe_v6", "probe_universe_v7",
-    "exp1_window", "exp1_matrix",
+    "exp1_window", "exp1_matrix", "exp1_matrix_v2",
 )
 
 # Defaut volontairement INERTE : chaque deploiement ou redemarrage de
@@ -102,6 +103,13 @@ def main() -> int:
             ", ".join(m for m in RUN_MODES if m != "idle"),
         )
         log.info("Fin de run (idle).")
+        return 0
+
+    if mode == "exp1_matrix_v2":
+        import exp1_matrix_v2
+
+        exp1_matrix_v2.main()
+        log.info("Fin de run (%s).", mode)
         return 0
 
     if mode == "exp1_matrix":

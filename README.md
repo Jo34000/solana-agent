@@ -39,6 +39,7 @@ Ce repo est construit par briques.
 | `graduations.py` | **Regles validees** : ou est le pool, qu'est-ce qu'une graduation, prix median |
 | `exp1_window.py` | **Experience 1** : la fenetre exploitable, ecrite dans `sol_grad_paths` |
 | `exp1_matrix.py` | **Experience 1** : la matrice, calculee sur les donnees deja ecrites |
+| `exp1_matrix_v2.py` | **Experience 1** : unites corrigees, creux, frais, conditionnements |
 | `solana_addr.py` | base58 et derivation de PDA, sans dependance externe |
 
 ## Installation
@@ -54,7 +55,7 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7`, `exp1_window`, `exp1_matrix` |
+| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7`, `exp1_window`, `exp1_matrix`, `exp1_matrix_v2` |
 | `FORCE_REMEASURE` | `true` pour refaire une mesure deja faite (voir plus bas) |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
@@ -64,6 +65,9 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 | `MAX_CREDITS` | **Optionnelle**, `exp1_window` : plafond de credits Helius (defaut **130 000**) |
 | `ENTRY_MULTIPLE` | **Optionnelle**, `exp1_window` : seuil d'entree en etape 2, en multiple de la capitalisation a la graduation (defaut **x2**) |
 | `STAGE2_CREDITS` | **Optionnelle**, `exp1_window` : budget propre a l'etape 2 (defaut **30 000**) |
+| `ACTIVITY_WINDOW_S` | **Optionnelle**, `exp1_window` : fenetre d'activite, la meme a tous les horizons (defaut **600 s**) |
+| `SUPPLY_CREDITS` | **Optionnelle**, `exp1_matrix_v2` : plafond de relecture des supplies (defaut **3 000**) |
+| `ROUND_TRIP_COST` | **Optionnelle**, `exp1_matrix_v2` : frais d'aller-retour (defaut **0.03**) |
 | `STAGE1_SAMPLE` | **Optionnelle**, `exp1_window` : fraction des graduations mesurees en etape 1 (defaut **1.0**) |
 | `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v7` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
 
@@ -95,6 +99,7 @@ RUN_MODE=probe_universe_v6 python main.py # sonde univers v6, pool valide
 RUN_MODE=probe_universe_v7 python main.py # sonde univers v7, liste reparee
 RUN_MODE=exp1_window python main.py  # experience 1, fenetre exploitable
 RUN_MODE=exp1_matrix python main.py  # experience 1, matrice (aucun appel API)
+RUN_MODE=exp1_matrix_v2 python main.py # experience 1, unites corrigees + lecture fine
 ```
 
 | `RUN_MODE` | Effet |
@@ -117,6 +122,7 @@ RUN_MODE=exp1_matrix python main.py  # experience 1, matrice (aucun appel API)
 | `probe_universe_v7` | sonde univers v7, liste reparee et graduation definie |
 | `exp1_window` | **experience 1** : ecrit des resultats dans `sol_grad_paths` |
 | `exp1_matrix` | **experience 1** : calcul de la matrice, **aucun appel API** |
+| `exp1_matrix_v2` | **experience 1** : unites corrigees puis lecture fine, `getTokenSupply` seul |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -707,6 +713,75 @@ Les regles validees par les sondes sortent des fichiers jetables : une
 experience ne doit pas dependre d'une sonde. Le module ne fait **aucun
 appel reseau**, il ne lit que des payloads — pool, graduation, signature
 (qui n'est **pas** a la racine), prix median d'une page.
+
+### La lecture fine : `RUN_MODE=exp1_matrix_v2`
+
+Lecture de `sol_grad_paths`. Seul appel autorise : `getTokenSupply` sur
+les tokens suspects, sous plafond.
+
+**Une courbe pump.fun gradue a reserve fixe** : la capitalisation **en
+SOL** a la graduation doit etre tres resserree. Toute dispersion est un
+defaut de mesure, pas un fait de marche. La section 1 affiche p5, mediane,
+p95, marque les tokens hors de +/- 30 % de la mediane, **relit leur
+supply** et nomme la cause : supply brute stockee au lieu des unites
+affichees, decimales differentes de 6, supply hors norme pump.fun, ou
+supply correcte — auquel cas c'est le **prix** qui derape.
+
+La correction est un simple **rapport** : la capitalisation vaut
+`prix x taux x supply`, donc la corriger revient a la multiplier par
+`supply_corrigee / supply_stockee`. Aucun prix du SOL n'est redemande. Les
+taux de base sont affiches **avant et apres**.
+
+### La fenetre d'activite s'elargissait avec l'horizon
+
+L'ancienne tolerance valait `max(15 min, 25 % de l'horizon)` :
+
+| horizon | fenetre d'alors |
+| --- | --- |
+| 5 min a 60 min | +/- 15 min |
+| 6 h | +/- 90 min |
+| 24 h | +/- 6 h |
+| **7 j** | **+/- 42 h** |
+
+A 7 jours, un swap **42 heures** apres l'instant vise comptait comme
+« actif ». `exp1_window` applique desormais **une seule fenetre, +/- 10
+min a tous les horizons**, et **enregistre `ecart_s`** a chaque point pour
+qu'un futur calcul puisse re-filtrer. Les points deja ecrits ne portent
+pas cet ecart : `exp1_matrix_v2` le dit, affiche la fenetre reellement
+utilisee horizon par horizon, et ne fait pas semblant de pouvoir
+re-filtrer.
+
+### Ce que la ligne enregistre desormais
+
+`decimals`, `supply_raw`, et par point `ecart_s` et `sol_usd` — le taux de
+change utilise, pour qu'une capitalisation se recalcule **hors ligne**.
+`uiAmount` peut valoir `null` quand la valeur ne tient pas dans un
+flottant : la supply est alors recalculee depuis `amount` et `decimals`,
+au lieu de tomber a zero en silence.
+
+Ces deux colonnes exigent un `ALTER TABLE`, que la ligne de test du
+demarrage detecte **avant la moindre depense** :
+
+```sql
+alter table sol_grad_paths add column if not exists decimals   int;
+alter table sol_grad_paths add column if not exists supply_raw numeric;
+```
+
+### Creux, frais et conditionnements
+
+- **Creux** = `min(prix aux points mesures entre l'entree et l'horizon) /
+  prix d'entree`, mediane et p10. **Max** = la meme chose au maximum, avec
+  la part des tokens ayant touche x1,5, x2, x5 **avant** l'horizon.
+- **Frais** : `ROUND_TRIP_COST` (3 % par defaut) s'applique en
+  **multiplicatif** — un aller-retour laisse 0,97 du multiple brut. La
+  convention est ecrite, pas devinee. Brut et net sont affiches cote a
+  cote.
+- **Deux conditionnements** a L = 15 min, horizons 1 h / 2 h / 3 h / 6 h :
+  par **capitalisation d'entree corrigee** en multiple de celle a la
+  graduation (`< x1,5`, `x1,5-3`, `x3-10`, `> x10`), et par **elan**
+  (`prix a 15 min / prix a 5 min` : `< 0,8`, `0,8-1,2`, `> 1,2`). Chaque
+  case donne effectif, mediane nette, part `>= x2`, part `<= x0,3` et
+  moyenne nette inactifs comptes a zero.
 
 ### Le calcul separe : `RUN_MODE=exp1_matrix`
 

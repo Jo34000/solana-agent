@@ -270,28 +270,53 @@ def swap_price(lines: list[dict]) -> float | None:
 
 
 def median_swap_price(rows: list[dict], moment: float,
-                      tolerance: float) -> tuple[float | None, int]:
-    """(prix median en SOL des swaps de la page, nombre retenu).
+                      window: float) -> tuple[float | None, int, float]:
+    """(prix median en SOL, nombre de swaps, ecart median a l'instant vise).
 
-    Seuls les swaps de la fenetre [moment, moment + tolerance] comptent.
-    Aucun swap dans cette fenetre n'est pas une perte : c'est un token
+    UNE definition de l'activite, la meme a tous les horizons : un swap
+    compte s'il tombe dans [moment - window, moment + window]. La fenetre
+    ne s'elargit PAS avec l'horizon ; l'ancienne tolerance proportionnelle
+    acceptait un swap 42 heures apres l'instant vise a 7 jours, et
+    appelait cela "actif".
+
+    Aucun swap dans la fenetre n'est pas une perte : c'est un token
     INACTIF a cet instant, et l'appelant l'enregistre comme tel.
     """
     prices: list[float] = []
+    gaps: list[float] = []
     for lines in group_by_signature(rows).values():
         stamps = [line_time(line) for line in lines if line_time(line) > 0]
         when = max(stamps) if stamps else 0.0
-        # Fenetre [moment, moment + tolerance] : un swap ANTERIEUR n'est pas
-        # un prix a cet instant, il est ecarte comme un swap trop tardif.
-        if when and not 0 <= when - moment <= tolerance:
+        if when and abs(when - moment) > window:
             continue
         price = swap_price(lines)
         if price:
             prices.append(price)
+            gaps.append(abs(when - moment) if when else 0.0)
     if not prices:
-        return None, 0
-    prices.sort()
-    middle = len(prices) // 2
-    median = (prices[middle] if len(prices) % 2
-              else (prices[middle - 1] + prices[middle]) / 2)
-    return median, len(prices)
+        return None, 0, 0.0
+    ordered = sorted(prices)
+    middle = len(ordered) // 2
+    median = (ordered[middle] if len(ordered) % 2
+              else (ordered[middle - 1] + ordered[middle]) / 2)
+    gaps.sort()
+    return median, len(ordered), gaps[len(gaps) // 2]
+
+
+def supply_of(value: dict | None) -> tuple[float, int, float]:
+    """(supply en unites AFFICHEES, decimales, supply brute).
+
+    uiAmount peut valoir null quand la valeur ne tient pas dans un float :
+    la supply est alors recalculee depuis amount et decimals. Une supply
+    a zero fait disparaitre toute capitalisation, en silence.
+    """
+    if not isinstance(value, dict):
+        return 0.0, 0, 0.0
+    decimals = int(to_float(value.get("decimals")))
+    raw = to_float(value.get("amount"))
+    ui = to_float(value.get("uiAmount"))
+    if not ui:
+        ui = to_float(value.get("uiAmountString"))
+    if not ui and raw:
+        ui = raw / (10 ** decimals) if decimals else raw
+    return ui, decimals, raw

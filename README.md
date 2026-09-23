@@ -40,6 +40,7 @@ Ce repo est construit par briques.
 | `exp1_window.py` | **Experience 1** : la fenetre exploitable, ecrite dans `sol_grad_paths` |
 | `exp1_matrix.py` | **Experience 1** : la matrice, calculee sur les donnees deja ecrites |
 | `exp1_matrix_v2.py` | **Experience 1** : unites corrigees, creux, frais, conditionnements |
+| `exp1_close.py` | **Experience 1** : cloture, validation externe et regles de sortie |
 | `solana_addr.py` | base58 et derivation de PDA, sans dependance externe |
 
 ## Installation
@@ -55,7 +56,7 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7`, `exp1_window`, `exp1_matrix`, `exp1_matrix_v2` |
+| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7`, `exp1_window`, `exp1_matrix`, `exp1_matrix_v2`, `exp1_close` |
 | `FORCE_REMEASURE` | `true` pour refaire une mesure deja faite (voir plus bas) |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
@@ -67,7 +68,9 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 | `STAGE2_CREDITS` | **Optionnelle**, `exp1_window` : budget propre a l'etape 2 (defaut **30 000**) |
 | `ACTIVITY_WINDOW_S` | **Optionnelle**, `exp1_window` : fenetre d'activite, la meme a tous les horizons (defaut **600 s**) |
 | `SUPPLY_CREDITS` | **Optionnelle**, `exp1_matrix_v2` : plafond de relecture des supplies (defaut **3 000**) |
-| `ROUND_TRIP_COST` | **Optionnelle**, `exp1_matrix_v2` : frais d'aller-retour (defaut **0.03**) |
+| `ROUND_TRIP_COST` | **Optionnelle**, `exp1_matrix_v2` et `exp1_close` : frais d'aller-retour (defaut **0.03**) |
+| `CLOSE_MAX_CALLS` | **Optionnelle**, `exp1_close` : plafond d'appels CoinGecko (defaut **40**) |
+| `CLOSE_PAUSE_S` | **Optionnelle**, `exp1_close` : pause entre deux appels (defaut **2.5 s**) |
 | `STAGE1_SAMPLE` | **Optionnelle**, `exp1_window` : fraction des graduations mesurees en etape 1 (defaut **1.0**) |
 | `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v7` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
 
@@ -100,6 +103,7 @@ RUN_MODE=probe_universe_v7 python main.py # sonde univers v7, liste reparee
 RUN_MODE=exp1_window python main.py  # experience 1, fenetre exploitable
 RUN_MODE=exp1_matrix python main.py  # experience 1, matrice (aucun appel API)
 RUN_MODE=exp1_matrix_v2 python main.py # experience 1, unites corrigees + lecture fine
+RUN_MODE=exp1_close python main.py   # experience 1, cloture (CoinGecko seul)
 ```
 
 | `RUN_MODE` | Effet |
@@ -123,6 +127,7 @@ RUN_MODE=exp1_matrix_v2 python main.py # experience 1, unites corrigees + lectur
 | `exp1_window` | **experience 1** : ecrit des resultats dans `sol_grad_paths` |
 | `exp1_matrix` | **experience 1** : calcul de la matrice, **aucun appel API** |
 | `exp1_matrix_v2` | **experience 1** : unites corrigees puis lecture fine, `getTokenSupply` seul |
+| `exp1_close` | **experience 1** : cloture, **aucun appel Helius**, CoinGecko sous plafond |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -713,6 +718,70 @@ Les regles validees par les sondes sortent des fichiers jetables : une
 experience ne doit pas dependre d'une sonde. Le module ne fait **aucun
 appel reseau**, il ne lit que des payloads — pool, graduation, signature
 (qui n'est **pas** a la racine), prix median d'une page.
+
+## La cloture : `RUN_MODE=exp1_close`
+
+Aucun appel Helius. Lecture de `sol_grad_paths`, et **CoinGecko seul**
+sous plafond, avec une pause de 2,5 s entre deux appels.
+
+Les niveaux de capitalisation en dollars sont faux — ecart p95/p5 de dix
+millions a la graduation. L'hypothese est que l'erreur est un **facteur
+constant par token**, donc que les **ratios** de prix d'un meme token sont
+justes. **Toute la section 2 en depend** : si la section 1 ne valide pas,
+la section 2 ne conclut rien et ses chiffres ne sont pas repris.
+
+### La cause du bug, trouvee par lecture
+
+`amount_of` acceptait le champ `amount` **tel quel**. Or Helius rend le
+SOL natif en **lamports** (x1e9) et un montant de token parfois en unites
+**brutes** (x10^decimals). Divisee par la jambe opposee, une jambe lue
+dans la mauvaise unite donne un prix faux d'un facteur **exactement egal
+a une puissance de 10** — la signature meme que la section 1 cherche.
+
+`graduations.py` convertit desormais tout champ brut (9 decimales pour
+une jambe SOL, celles de la ligne pour un token) et **refuse** un montant
+brut dont l'unite est inconnue plutot que de la deviner. Le module compte
+aussi **quel champ a servi** : un run qui melange les unites se voit dans
+ce compteur avant de se voir dans les prix.
+
+### Section 1 : validation externe
+
+20 tokens tires en strates (seed loguee) : 10 **calmes** (elan 5→15 min
+entre 0,8 et 1,2), 5 **deja pompes** (elan > 1,2), 5 **morts a 3 h**
+(ratio <= 0,3). Un token pouvant etre les deux, la classification est
+**ordonnee** — mort d'abord — et un token d'elan < 0,8 sans etre mort
+n'entre dans aucune strate : il est compte a part.
+
+Un appel OHLCV par token, bougies de **5 minutes**, de la graduation a
++4 h. Nos ratios `P(2 h)/P(15 min)` et `P(3 h)/P(15 min)` contre les
+leurs. **Accord** a +/-15 %, ou si les deux ratios sont <= 0,3. Verdict
+**VALIDE a >= 18/20**. Un token absent de GeckoTerminal est signale et
+remplace dans sa strate, sous le plafond d'appels.
+
+### Section 2 : les regles de sortie
+
+Latences 5 / 15 / 60 min, sorties forcees a 2 h et 3 h, frais 3 %.
+
+| Regle | Sortie |
+| --- | --- |
+| R0 | vente a H |
+| R1 | objectif x1,5 ou x2, vente **au prix de l'objectif** au premier point qui l'atteint |
+| R2 | R1 + stop a x0,7, vente **au prix du point** qui franchit le stop — pas a 0,7 : entre deux points, la chute est deja consommee |
+
+**Les points mesures sont espaces** : un objectif touche entre deux points
+est manque, donc R1 et R2 **sous-estiment** les sorties reussies. Le
+rappel est imprime en tete de section.
+
+Un token inactif a H donne **deux variantes cote a cote** : prix 0
+(prudente) et dernier prix actif (optimiste).
+
+### Section 3 : la barre a battre
+
+Les 5 meilleures combinaisons par moyenne nette prudente, avec leur
+effectif, et une phrase de verdict : une combinaison depasse-t-elle 1 ?
+Les combinaisons d'effectif inferieur a **30** sont ecartees du classement
+et leur nombre est affiche — une moyenne sur trois tokens n'est pas un
+resultat.
 
 ### La lecture fine : `RUN_MODE=exp1_matrix_v2`
 

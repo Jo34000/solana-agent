@@ -191,14 +191,19 @@ def ohlcv(
     timeframe: str = "day",
     limit: int = 60,
     before: int | None = None,
+    aggregate: int | None = None,
 ) -> list[list] | None:
     """Bougies d'un pool. timeframe : day, hour ou minute.
 
     before (timestamp epoch) remonte a une periode passee precise.
+    aggregate regroupe les bougies : minute + aggregate=5 rend des bougies
+    de cinq minutes.
     """
     params: dict[str, Any] = {"limit": limit, "currency": "usd"}
     if before:
         params["before_timestamp"] = int(before)
+    if aggregate:
+        params["aggregate"] = int(aggregate)
     payload = get(
         f"/networks/{NETWORK}/pools/{pool_address}/ohlcv/{timeframe}", params
     )

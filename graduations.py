@@ -49,13 +49,58 @@ def to_float(value: Any) -> float:
         return 0.0
 
 
-def amount_of(line: dict) -> float:
-    for key in ("uiAmount", "tokenAmount", "amount"):
-        if key in line:
-            value = to_float(line.get(key))
-            if value:
-                return value
-    return 0.0
+LAMPORTS_PER_SOL = 1_000_000_000
+SOL_DECIMALS = 9
+
+# Quel champ a servi, et combien de fois. Un run qui melange les unites se
+# voit ici avant de se voir dans les prix.
+_amount_fields: dict[str, int] = {}
+
+
+def amount_fields() -> dict[str, int]:
+    return dict(_amount_fields)
+
+
+def amount_of(line: dict, sol_leg: bool = False) -> float:
+    """Montant d'une jambe, TOUJOURS en unites affichees.
+
+    L'ancienne version acceptait `amount` tel quel. Or Helius rend le SOL
+    natif en LAMPORTS (x1e9) et un montant de token parfois en unites
+    brutes (x10^decimals) : divise par la jambe opposee, cela donnait des
+    prix faux d'un facteur exactement egal a une puissance de 10. Un champ
+    brut est donc desormais CONVERTI, jamais pris tel quel.
+    """
+    for key in ("uiAmount", "uiTokenAmount", "tokenAmount"):
+        value = line.get(key)
+        if isinstance(value, dict):          # {"uiAmount": ..., "decimals": ...}
+            value = value.get("uiAmount")
+        value = to_float(value)
+        if value:
+            _amount_fields[key] = _amount_fields.get(key, 0) + 1
+            return value
+
+    raw = line.get("rawTokenAmount")
+    decimals = line.get("decimals")
+    if isinstance(raw, dict):
+        decimals = raw.get("decimals", decimals)
+        raw = raw.get("tokenAmount")
+    if raw is None:
+        raw = line.get("amount")
+    raw = to_float(raw)
+    if not raw:
+        _amount_fields["absent"] = _amount_fields.get("absent", 0) + 1
+        return 0.0
+
+    if decimals is None:
+        decimals = SOL_DECIMALS if sol_leg else None
+    if decimals is None:
+        # Unite inconnue sur une jambe de token : la retenir ferait un prix
+        # faux d'un facteur inconnu. On ne devine pas.
+        _amount_fields["brut_sans_decimales"] = _amount_fields.get(
+            "brut_sans_decimales", 0) + 1
+        return 0.0
+    _amount_fields["brut_converti"] = _amount_fields.get("brut_converti", 0) + 1
+    return raw / (10 ** int(to_float(decimals)))
 
 
 def line_time(line: dict) -> float:
@@ -260,7 +305,7 @@ def swap_price(lines: list[dict]) -> float | None:
         if not isinstance(line_mint, str):
             continue
         if line_mint in SOL_MINTS:
-            sol += amount_of(line)
+            sol += amount_of(line, sol_leg=True)
         elif mint is None or line_mint == mint:
             mint = line_mint
             token_amount += amount_of(line)

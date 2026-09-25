@@ -68,7 +68,10 @@ FEE_PREFIX = "9C4nRvhh"
 MAX_CREDITS = exp._env_int("MAX_CREDITS", 100_000)
 SECTION1_CREDITS = exp._env_int("EXP2_S1_CREDITS", 45_000)
 SECTION3_CREDITS = exp._env_int("EXP2_S3_CREDITS", 40_000)
-GATE_CALLS = exp._env_int("EXP2_GATE_CALLS", 25)
+GATE_CALLS = exp._env_int("EXP2_GATE_CALLS", 35)
+# La porte a sa propre graine : le run du 25/09 a deja compare
+# 20 tokens, et le reste de l'experience garde la sienne.
+GATE_SEED = exp._env_int("EXP2_GATE_SEED", 20260930)
 PAUSE_S = exp._env_float("CLOSE_PAUSE_S", 2.5)
 ROUND_TRIP_COST = exp._env_float("ROUND_TRIP_COST", 0.03)
 RANDOM_SEED = exp._env_int("RANDOM_SEED", 20260929)
@@ -99,9 +102,17 @@ OOS_STATUS = "exp2_oos"
 GATE_STRATA = (("calmes", 10), ("deja pompes", 5), ("morts a 3 h", 5))
 GATE_LABELS = ("60 min", "2 h", "3 h")
 GATE_BAND_LOW, GATE_BAND_HIGH = 0.95, 1.05
-GATE_WINDOW_S = 600
+# Fenetre de bougies ALIGNEE sur la tolerance qui a servi a mesurer le
+# point : les trajectoires du 11 au 13/09 ont ete prises avec une
+# tolerance proportionnelle, max(15 min, 25 % de l'horizon). Comparer un
+# point de 3 h a une fenetre de 10 min reprocherait a GeckoTerminal un
+# ecart que notre propre mesure s'autorisait.
+GATE_WINDOWS = {"60 min": 900, "2 h": 1800, "3 h": 2700}
 GATE_MIN = 18
 GATE_TOTAL = 20
+# Deux conditions, et non une : 18 tokens sans aucun point
+# hors fourchette, ET 90 % des points compares dedans.
+GATE_POINT_RATIO = 0.90
 CANDLE_SECONDS = 300
 
 EXCLUDED_PREFIXES = ("6EF8rrec", "pAMMBay6", "Tokenz", "Tokenkeg", "ATokenGP",
@@ -459,32 +470,44 @@ def strate_of(row: dict) -> str | None:
 
 
 def already_tested() -> set[str]:
-    """Mints deja compares par exp1_close : la porte en tire de NOUVEAUX."""
-    try:
-        rows = db.fetch_run_log("exp1_close", "recap", 5)
-    except Exception as error:               # noqa: BLE001
-        log.warning("Relecture d'exp1_close impossible (%s) : le tirage ne "
-                    "peut pas garantir des tokens nouveaux", error)
-        return set()
-    for row in rows:
-        payload = row.get("payload") or {}
-        details = (payload.get("validation") or {}).get("details") or []
-        mints = {d.get("mint") for d in details if isinstance(d, dict)}
-        if mints:
-            print(f"  {len(mints)} token(s) deja compares par exp1_close, "
-                  f"ecartes du tirage")
-            return {m for m in mints if isinstance(m, str)}
-    print("  aucun token deja compare retrouve : le tirage ne peut pas "
-          "garantir la nouveaute")
-    return set()
+    """Mints deja compares, par exp1_close ET par les portes precedentes.
+
+    Un token deja compare ne prouve plus rien : la porte en tire de
+    NOUVEAUX, et le tirage a sa propre graine pour cela.
+    """
+    seen: set[str] = set()
+    for run_mode, section, path in (("exp1_close", "recap", "validation"),
+                                    (RUN_MODE, "0", None)):
+        try:
+            rows = db.fetch_run_log(run_mode, section, 10)
+        except Exception as error:           # noqa: BLE001
+            log.warning("Relecture de %s/%s impossible (%s) : le tirage ne "
+                        "peut pas garantir des tokens nouveaux", run_mode,
+                        section, error)
+            continue
+        found = 0
+        for row in rows:
+            payload = row.get("payload") or {}
+            block = (payload.get(path) or {}) if path else payload
+            for detail in (block.get("details") or []):
+                mint = detail.get("mint") if isinstance(detail, dict) else None
+                if isinstance(mint, str):
+                    seen.add(mint)
+                    found += 1
+        print(f"  {found} token(s) deja compares par {run_mode}/{section}")
+    if not seen:
+        print("  aucun token deja compare retrouve : le tirage ne peut pas "
+              "garantir la nouveaute")
+    return seen
 
 
-def band_of(candles: list[list], moment: float) -> tuple[float, float]:
-    """[plus bas x 0,95 ; plus haut x 1,05] sur [t ; t + 10 min]."""
+def band_of(candles: list[list], moment: float,
+            window: float) -> tuple[float, float]:
+    """[plus bas x 0,95 ; plus haut x 1,05] sur [t ; t + window]."""
     lows, highs = [], []
     for candle in candles:
         start = rules.to_float(candle[0])
-        if moment - CANDLE_SECONDS < start <= moment + GATE_WINDOW_S:
+        if moment - CANDLE_SECONDS < start <= moment + window:
             lows.append(rules.to_float(candle[3]))
             highs.append(rules.to_float(candle[2]))
     lows = [v for v in lows if v > 0]
@@ -494,16 +517,19 @@ def band_of(candles: list[list], moment: float) -> tuple[float, float]:
     return min(lows) * GATE_BAND_LOW, max(highs) * GATE_BAND_HIGH
 
 
-def section_0(rows: list[dict], rng: random.Random) -> dict:
+def section_0(rows: list[dict]) -> dict:
     start_section("0", "Porte : validation des prix (CoinGecko seul)")
-    print(f"  {GATE_CALLS} appels au plus, pause {PAUSE_S} s | test B a "
-          f">= {GATE_MIN}/{GATE_TOTAL} pour continuer")
+    print(f"  {GATE_CALLS} appels au plus, pause {PAUSE_S} s | porte a "
+          f">= {GATE_MIN}/{GATE_TOTAL} tokens ET >= "
+          f"{GATE_POINT_RATIO:.0%} des points compares")
     print("  Le test B compare des NIVEAUX : notre prix en dollars est "
           "mcap_usd / supply, la grandeur validee a +15 min.")
+    print(f"  graine du tirage : {GATE_SEED}")
     if coingecko_api_key() is None:
         log.warning("Cle CoinGecko absente : la porte va echouer, et rien ne "
                     "sera valide en silence.")
     seen = already_tested()
+    rng = random.Random(GATE_SEED)
 
     pools: dict[str, list[dict]] = {name: [] for name, _ in GATE_STRATA}
     for row in rows:
@@ -518,16 +544,30 @@ def section_0(rows: list[dict], rng: random.Random) -> dict:
 
     results: list[dict] = []
     missing = 0
+    lost = 0
+    sans_point = 0
     for name, wanted in GATE_STRATA:
         queue = list(pools[name])
         kept = 0
         while kept < wanted and queue and _gecko_calls < GATE_CALLS:
             row = queue.pop(0)
             candles = candles_of(row["pool"], _grad_at(row))
+            if candles is None:
+                lost += 1
+                log.warning("PERTE : bougies de %s abandonnees, le token "
+                            "n'est ni un succes ni un echec", row["mint"][:8])
+                continue
             if not candles:
                 missing += 1
                 continue
-            results.append(_gate_token(row, candles, name))
+            detail = _gate_token(row, candles, name)
+            if detail["compares"] == 0:
+                # Aucun point comparable n'est pas un echec : c'est une
+                # absence de mesure, remplacee par un autre tirage de la
+                # meme strate, comme un token absent de GeckoTerminal.
+                sans_point += 1
+                continue
+            results.append(detail)
             kept += 1
         if kept < wanted:
             log.warning("Strate %s : %d/%d (plafond d'appels ou strate "
@@ -536,23 +576,48 @@ def section_0(rows: list[dict], rng: random.Random) -> dict:
     passed_a = sum(1 for r in results if r["test_a"])
     passed_b = sum(1 for r in results if r["test_b"])
     tested = len(results)
+    points = sum(r["compares"] for r in results)
+    inside = sum(r["dedans"] for r in results)
+    causes: Counter = Counter()
+    for detail in results:
+        causes.update(detail["causes"].values())
+    ratio = inside / points if points else 0.0
     print(f"\n  test A (ratios a +/-15 %) : {passed_a}/{tested}")
-    print(f"  test B (niveau dans la fourchette) : {passed_b}/{tested}")
-    print(f"  tokens absents de GeckoTerminal : {missing} | appels "
-          f"{_gecko_calls}/{GATE_CALLS}")
+    print(f"  test B (tous les points compares dans la fourchette) : "
+          f"{passed_b}/{tested}")
+    print(f"  points compares : {inside}/{points} dans la fourchette "
+          f"({ratio:.0%})")
+    print(f"  points non compares : {dict(causes) if causes else 'aucun'}")
+    print(f"  tokens sans aucun point comparable (retires du tirage) : "
+          f"{sans_point}")
+    print(f"  tokens absents de GeckoTerminal : {missing} | pertes : {lost} "
+          f"| appels {_gecko_calls}/{GATE_CALLS}")
     coherent("test B <= testes", passed_b <= tested,
              f"{passed_b} pour {tested}")
-    open_gate = passed_b >= GATE_MIN and tested >= GATE_MIN
+    coherent("points dans la fourchette <= points compares", inside <= points,
+             f"{inside} pour {points}")
+    coherent("tout token retenu a au moins un point compare",
+             all(r["compares"] > 0 for r in results),
+             f"{sum(1 for r in results if r['compares'] == 0)} sans point")
+    enough = tested >= GATE_MIN
+    open_gate = (enough and passed_b >= GATE_MIN
+                 and points > 0 and ratio >= GATE_POINT_RATIO)
     print(f"  PORTE : {'OUVERTE' if open_gate else 'FERMEE'}")
     if not open_gate:
+        if not enough:
+            print(f"    {tested} token(s) compares seulement : la porte "
+                  f"demande {GATE_MIN} sur {GATE_TOTAL}.")
         print("    Aucun appel Helius ne sera fait : les prix ne sont pas "
               "surs en niveau, et l'eligibilite a 60 000 $ en depend.")
     return {"testes": tested, "test_a": passed_a, "test_b": passed_b,
-            "absents": missing, "appels": _gecko_calls, "porte": open_gate,
-            "details": results}
+            "points": points, "points_dedans": inside, "part": ratio,
+            "causes": dict(causes), "sans_point": sans_point,
+            "absents": missing, "pertes": lost, "graine": GATE_SEED,
+            "appels": _gecko_calls, "porte": open_gate, "details": results}
 
 
 def _gate_token(row: dict, candles: list[list], strate: str) -> dict:
+    """Compare un token point par point, et dit pourquoi un point manque."""
     graduated = _grad_at(row)
     supply = rules.to_float(row.get("supply"))
     entry_ours = price_at(row, "15 min")
@@ -561,12 +626,16 @@ def _gate_token(row: dict, candles: list[list], strate: str) -> dict:
     ratios_ok = []
     levels_ok = []
     detail: dict[str, Any] = {"mint": row["mint"], "strate": strate,
-                              "niveaux": {}}
+                              "niveaux": {}, "causes": {}}
     for label in GATE_LABELS:
         moment = graduated + exp.POINT_SECONDS[label]
         ours_usd = mcap_at(row, label) / supply if supply > 0 else 0.0
-        low, high = band_of(candles, moment)
-        if ours_usd > 0 and low > 0:
+        low, high = band_of(candles, moment, GATE_WINDOWS[label])
+        if ours_usd <= 0:
+            detail["causes"][label] = "notre point absent (inactif)"
+        elif low <= 0:
+            detail["causes"][label] = "aucune bougie dans la fenetre"
+        else:
             inside = low <= ours_usd <= high
             levels_ok.append(inside)
             detail["niveaux"][label] = {"notre_prix": ours_usd,
@@ -580,13 +649,17 @@ def _gate_token(row: dict, candles: list[list], strate: str) -> dict:
             close = (min(ours, theirs_ratio) / max(ours, theirs_ratio) >= 0.85
                      if max(ours, theirs_ratio) > 0 else False)
             ratios_ok.append(bool(both_dead or close))
+    detail["compares"] = len(levels_ok)
+    detail["dedans"] = sum(1 for ok in levels_ok if ok)
     detail["test_a"] = bool(ratios_ok) and all(ratios_ok)
     detail["test_b"] = bool(levels_ok) and all(levels_ok)
     marks = {label: block["dedans"]
              for label, block in detail["niveaux"].items()}
+    causes = "" if not detail["causes"] else f" | {detail['causes']}"
     print(f"    {row['mint'][:8]}.. ({strate:>12}) : A "
           f"{'ok' if detail['test_a'] else 'NON':>3} | B "
-          f"{'ok' if detail['test_b'] else 'NON':>3} {marks}")
+          f"{'ok' if detail['test_b'] else 'NON':>3} "
+          f"{detail['dedans']}/{detail['compares']} {marks}{causes}")
     return detail
 
 
@@ -1250,7 +1323,7 @@ def main() -> None:
 
     rng = random.Random(RANDOM_SEED)
     results: dict[str, Any] = {}
-    results["0"] = section_0(in_sample, rng)
+    results["0"] = section_0(in_sample)
     log_run("0", "porte", results["0"])
     if not results["0"].get("porte"):
         print("\nARRET : la porte est fermee, aucun appel Helius n'a ete "

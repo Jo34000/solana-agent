@@ -73,6 +73,8 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 | `CLOSE_MAX_CALLS` | **Optionnelle**, `exp1_close` : plafond d'appels CoinGecko (defaut **40**) |
 | `CLOSE_PAUSE_S` | **Optionnelle**, `exp1_close` et `exp2_wallets` : pause entre deux appels (defaut **2.5 s**) |
 | `EXP2_S1_CREDITS` | **Optionnelle**, `exp2_wallets` : plafond de la section 1 (defaut **45 000**) |
+| `EXP2_GATE_CALLS` | **Optionnelle**, `exp2_wallets` : plafond d'appels CoinGecko de la porte (defaut **35**) |
+| `EXP2_GATE_SEED` | **Optionnelle**, `exp2_wallets` : graine du tirage de la porte (defaut **20260930**) |
 | `EXP2_S3_CREDITS` | **Optionnelle**, `exp2_wallets` : plafond de la section 3 (defaut **40 000**) |
 | `STAGE1_SAMPLE` | **Optionnelle**, `exp1_window` : fraction des graduations mesurees en etape 1 (defaut **1.0**) |
 | `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v7` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
@@ -753,11 +755,31 @@ la moindre depense.
 ### Quatre garde-fous, dans l'ordre
 
 1. **Une porte avant toute depense Helius.** La section 0 n'utilise que
-   CoinGecko : 20 nouveaux tokens, et un **test de niveau** — notre prix
-   en dollars a 60 min, 2 h et 3 h tombe-t-il dans la fourchette
-   `[plus bas x 0,95 ; plus haut x 1,05]` des bougies de 5 min couvrant
-   `[t ; t + 10 min]` ? **Moins de 18/20 : arret**, sans un seul credit
-   Helius. L'eligibilite a 60 000 $ depend de ces niveaux.
+   CoinGecko : 20 nouveaux tokens (graine propre, loguee, excluant ceux
+   que `exp1_close` et les portes precedentes ont deja compares), et un
+   **test de niveau** — notre prix en dollars a 60 min, 2 h et 3 h
+   tombe-t-il dans la fourchette `[plus bas x 0,95 ; plus haut x 1,05]`
+   des bougies de 5 min de la fenetre du point ? La porte s'ouvre a
+   **>= 18/20 tokens dont tous les points compares sont dans la
+   fourchette, ET >= 90 % des points compares**. Sinon **arret**, sans un
+   seul credit Helius. L'eligibilite a 60 000 $ depend de ces niveaux.
+
+   Trois precisions, apprises du run du 25/09 (porte fermee a 14/20 alors
+   que **5 des 6 echecs n'avaient compare aucun point**) :
+
+   - **La fenetre des bougies suit la tolerance de mesure** : 15 min a
+     60 min, 30 min a 2 h, 45 min a 3 h. Les trajectoires du 11 au 13/09
+     ont ete prises avec une tolerance proportionnelle,
+     `max(15 min, 25 % de l'horizon)` ; comparer un point de 3 h a une
+     fenetre de 10 min reprocherait a GeckoTerminal un ecart que notre
+     propre mesure s'autorisait.
+   - **Un point non compare dit pourquoi** : « notre point absent
+     (inactif) » ou « aucune bougie dans la fenetre ». Les causes sont
+     comptees et loguees.
+   - **Un token sans aucun point comparable n'est ni un succes ni un
+     echec** : il n'est pas compte, et un autre token de la meme strate
+     est tire a sa place, exactement comme un token absent de
+     GeckoTerminal.
 2. **Un placebo avant de depenser pour le hors echantillon.** 200
    permutations des resultats **entre tokens** : la structure
    wallet-token reste, le lien token-resultat saute. Si le score moyen

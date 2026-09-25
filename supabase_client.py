@@ -122,6 +122,26 @@ Colonnes attendues sur sol_grad_paths, trajectoires des graduations :
 
 Un token sans echange autour d'un instant n'est pas une perte : son point
 vaut null avec actif = false. C'est une mesure, et elle compte.
+
+Colonnes attendues sur sol_grad_buys, acheteurs precoces (experience 2) :
+    mint         text  -- cle primaire sur le couple (mint, wallet)
+    wallet       text
+    jour         date
+    first_buy_at timestamptz
+    sol_engage   numeric
+    rang         int   (1 = premier acheteur de la fenetre)
+    updated_at   timestamptz
+
+    create table if not exists sol_grad_buys (
+      mint         text not null,
+      wallet       text not null,
+      jour         date,
+      first_buy_at timestamptz,
+      sol_engage   numeric,
+      rang         int,
+      updated_at   timestamptz default now(),
+      primary key (mint, wallet)
+    );
 """
 
 from __future__ import annotations
@@ -135,6 +155,7 @@ from supabase import Client, create_client
 from config import (
     ANALYZED_TABLE,
     EARLY_BUYS_TABLE,
+    GRAD_BUYS_TABLE,
     GRAD_PATHS_TABLE,
     RUN_LOG_TABLE,
     SMART_WALLETS_TABLE,
@@ -537,4 +558,54 @@ def fetch_all_grad_paths() -> list[dict]:
         start += _PAGE_SIZE
     log.info("Supabase : %d trajectoire(s) relues dans %s",
              len(rows), GRAD_PATHS_TABLE)
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Acheteurs precoces
+# ---------------------------------------------------------------------------
+
+
+def upsert_grad_buys(rows: list[dict]) -> int:
+    """Ecrit les acheteurs d'UN token. Leve si la base ne confirme rien.
+
+    Le couple (mint, wallet) est unique : une relance reecrit la meme
+    ligne au lieu d'en creer une seconde.
+    """
+    if not rows:
+        return 0
+    response = (
+        get_client()
+        .table(GRAD_BUYS_TABLE)
+        .upsert(rows, on_conflict="mint,wallet")
+        .execute()
+    )
+    written = len(response.data or [])
+    if written < len(rows):
+        raise RuntimeError(
+            f"Ecriture partielle dans {GRAD_BUYS_TABLE} : {written} "
+            f"confirmees sur {len(rows)} (verifier les policies RLS)."
+        )
+    return written
+
+
+def fetch_grad_buys(days: list[str] | None = None) -> list[dict]:
+    """Tous les achats deja enregistres, pour la reprise et l'analyse."""
+    rows: list[dict] = []
+    start = 0
+    while True:
+        query = (
+            get_client()
+            .table(GRAD_BUYS_TABLE)
+            .select("mint, wallet, jour, first_buy_at, sol_engage, rang")
+        )
+        if days:
+            query = query.in_("jour", days)
+        response = query.range(start, start + _PAGE_SIZE - 1).execute()
+        page = response.data or []
+        rows += page
+        if len(page) < _PAGE_SIZE:
+            break
+        start += _PAGE_SIZE
+    log.info("Supabase : %d achat(s) relus dans %s", len(rows), GRAD_BUYS_TABLE)
     return rows

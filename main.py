@@ -24,6 +24,7 @@ variable d'environnement RUN_MODE.
     RUN_MODE=exp1_matrix           -> experience 1 : matrice, AUCUN appel API
     RUN_MODE=exp1_matrix_v2        -> experience 1 : unites corrigees, lecture fine
     RUN_MODE=exp1_close            -> experience 1 : cloture, validation externe
+    RUN_MODE=exp2_wallets          -> experience 2 : les wallets apportent-ils ?
 
 Start Command Railway : python main.py
 """
@@ -45,6 +46,7 @@ RUN_MODES = (
     "probe_universe_v2", "probe_universe_v3", "probe_universe_v4",
     "probe_universe_v5", "probe_universe_v6", "probe_universe_v7",
     "exp1_window", "exp1_matrix", "exp1_matrix_v2", "exp1_close",
+    "exp2_wallets",
 )
 
 # Defaut volontairement INERTE : chaque deploiement ou redemarrage de
@@ -104,6 +106,13 @@ def main() -> int:
             ", ".join(m for m in RUN_MODES if m != "idle"),
         )
         log.info("Fin de run (idle).")
+        return 0
+
+    if mode == "exp2_wallets":
+        import exp2_wallets
+
+        exp2_wallets.main()
+        log.info("Fin de run (%s).", mode)
         return 0
 
     if mode == "exp1_close":

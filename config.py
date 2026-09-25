@@ -165,6 +165,8 @@ SMART_WALLETS_TABLE = "sol_smart_wallets"
 RUN_LOG_TABLE = "sol_run_log"
 # Trajectoires des graduations, ecrites par les experiences.
 GRAD_PATHS_TABLE = "sol_grad_paths"
+# Acheteurs precoces d'une graduation (experience 2).
+GRAD_BUYS_TABLE = "sol_grad_buys"
 
 # Seuil de performance a partir duquel un token compte comme gagnant dans le
 # backtest (x2 sur le prix d'entree).

@@ -41,6 +41,7 @@ Ce repo est construit par briques.
 | `exp1_matrix.py` | **Experience 1** : la matrice, calculee sur les donnees deja ecrites |
 | `exp1_matrix_v2.py` | **Experience 1** : unites corrigees, creux, frais, conditionnements |
 | `exp1_close.py` | **Experience 1** : cloture, validation externe et regles de sortie |
+| `exp2_wallets.py` | **Experience 2** : les wallets apportent-ils quelque chose ? |
 | `solana_addr.py` | base58 et derivation de PDA, sans dependance externe |
 
 ## Installation
@@ -56,7 +57,7 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7`, `exp1_window`, `exp1_matrix`, `exp1_matrix_v2`, `exp1_close` |
+| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7`, `exp1_window`, `exp1_matrix`, `exp1_matrix_v2`, `exp1_close`, `exp2_wallets` |
 | `FORCE_REMEASURE` | `true` pour refaire une mesure deja faite (voir plus bas) |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
@@ -70,7 +71,9 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 | `SUPPLY_CREDITS` | **Optionnelle**, `exp1_matrix_v2` : plafond de relecture des supplies (defaut **3 000**) |
 | `ROUND_TRIP_COST` | **Optionnelle**, `exp1_matrix_v2` et `exp1_close` : frais d'aller-retour (defaut **0.03**) |
 | `CLOSE_MAX_CALLS` | **Optionnelle**, `exp1_close` : plafond d'appels CoinGecko (defaut **40**) |
-| `CLOSE_PAUSE_S` | **Optionnelle**, `exp1_close` : pause entre deux appels (defaut **2.5 s**) |
+| `CLOSE_PAUSE_S` | **Optionnelle**, `exp1_close` et `exp2_wallets` : pause entre deux appels (defaut **2.5 s**) |
+| `EXP2_S1_CREDITS` | **Optionnelle**, `exp2_wallets` : plafond de la section 1 (defaut **45 000**) |
+| `EXP2_S3_CREDITS` | **Optionnelle**, `exp2_wallets` : plafond de la section 3 (defaut **40 000**) |
 | `STAGE1_SAMPLE` | **Optionnelle**, `exp1_window` : fraction des graduations mesurees en etape 1 (defaut **1.0**) |
 | `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v7` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
 
@@ -104,6 +107,7 @@ RUN_MODE=exp1_window python main.py  # experience 1, fenetre exploitable
 RUN_MODE=exp1_matrix python main.py  # experience 1, matrice (aucun appel API)
 RUN_MODE=exp1_matrix_v2 python main.py # experience 1, unites corrigees + lecture fine
 RUN_MODE=exp1_close python main.py   # experience 1, cloture (CoinGecko seul)
+RUN_MODE=exp2_wallets python main.py # experience 2, les wallets
 ```
 
 | `RUN_MODE` | Effet |
@@ -128,6 +132,7 @@ RUN_MODE=exp1_close python main.py   # experience 1, cloture (CoinGecko seul)
 | `exp1_matrix` | **experience 1** : calcul de la matrice, **aucun appel API** |
 | `exp1_matrix_v2` | **experience 1** : unites corrigees puis lecture fine, `getTokenSupply` seul |
 | `exp1_close` | **experience 1** : cloture, **aucun appel Helius**, CoinGecko sous plafond |
+| `exp2_wallets` | **experience 2** : signal d'acheteur precoce, teste **hors echantillon** |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -718,6 +723,96 @@ Les regles validees par les sondes sortent des fichiers jetables : une
 experience ne doit pas dependre d'une sonde. Le module ne fait **aucun
 appel reseau**, il ne lit que des payloads — pool, graduation, signature
 (qui n'est **pas** a la racine), prix median d'une page.
+
+## L'experience 2 : `RUN_MODE=exp2_wallets`
+
+Un signal d'acheteur precoce vaut-il mieux que de prendre les graduations
+au hasard ? La reponse se juge **hors echantillon**, sur des journees que
+la selection n'a pas vues, avec des regles **ecrites avant** de les
+regarder.
+
+### La table
+
+```sql
+create table if not exists sol_grad_buys (
+  mint         text not null,
+  wallet       text not null,
+  jour         date,
+  first_buy_at timestamptz,
+  sol_engage   numeric,
+  rang         int,
+  updated_at   timestamptz default now(),
+  primary key (mint, wallet)
+);
+```
+
+Le couple `(mint, wallet)` est unique : une relance reecrit la meme ligne
+au lieu d'en creer une seconde. L'ecriture est testee au demarrage, avant
+la moindre depense.
+
+### Quatre garde-fous, dans l'ordre
+
+1. **Une porte avant toute depense Helius.** La section 0 n'utilise que
+   CoinGecko : 20 nouveaux tokens, et un **test de niveau** — notre prix
+   en dollars a 60 min, 2 h et 3 h tombe-t-il dans la fourchette
+   `[plus bas x 0,95 ; plus haut x 1,05]` des bougies de 5 min couvrant
+   `[t ; t + 10 min]` ? **Moins de 18/20 : arret**, sans un seul credit
+   Helius. L'eligibilite a 60 000 $ depend de ces niveaux.
+2. **Un placebo avant de depenser pour le hors echantillon.** 200
+   permutations des resultats **entre tokens** : la structure
+   wallet-token reste, le lien token-resultat saute. Si le score moyen
+   des 30 retenus ne depasse pas le 95e percentile du placebo, c'est
+   « aucun signal en echantillon », et le hors echantillon n'est pas
+   paye.
+3. **Un pre-enregistrement.** Les 30 wallets **et les regles du verdict**
+   partent dans `sol_run_log` **avant** que la section 3 regarde quoi que
+   ce soit. Les regles ne peuvent plus etre ajustees a ce qu'on trouve.
+4. **Un verdict a trois issues.** `INCONCLUSIF` sous 60 tokens, en disant
+   combien il en manque ; `GO` seulement si les **quatre** conditions sont
+   reunies ; `NO-GO` si la borne basse de Wilson ne depasse pas le
+   benchmark.
+
+### Definitions, identiques des deux cotes
+
+| | |
+| --- | --- |
+| Signal | un wallet achete le token entre la graduation et **+10 min** |
+| Entree | prix a **+15 min** (variante +60 min) |
+| Eligible | capitalisation **>= 60 000 $ a l'instant d'entree** — aucune information posterieure |
+| Sorties | 2 h et 3 h, frais 3 %, inactif a la sortie en **deux variantes** |
+| Touche x2 | un point mesure entre l'entree et 3 h vaut au moins le double |
+
+Le point « graduation » **n'est plus utilise** : l'experience 1 l'a montre
+faux.
+
+### Quatre ecarts signales avant de coder
+
+1. **`filters.mint` n'a jamais ete valide.** La sonde du 19/09 a teste
+   `mint` comme cle de **premier niveau**, pas dans `filters` — et une cle
+   inconnue fait rejeter **tout** l'objet, donc aussi le `blockTime` dont
+   depend la fenetre. La section 1 fait **un** essai, puis s'en passe
+   definitivement en filtrant le mint cote client. Le verdict est logue.
+2. **« Present dans plus de 10 % des tokens tires »** ne se connait
+   qu'une fois tout l'echantillon collecte. Les pools, les programmes et
+   les deux comptes de migration sont exclus **a l'ecriture** ;
+   l'exclusion de frequence est appliquee **a l'analyse**, et les donnees
+   brutes restent en base — un autre seuil se rejoue sans repayer.
+3. **Les journees hors echantillon n'existent pas dans
+   `sol_grad_paths`.** Leurs mesures y sont ecrites avec
+   `status = "exp2_oos"`, pour que les modes de l'experience 1, qui ne
+   lisent que `status = "mesure"`, ne les melangent jamais a leur fenetre.
+4. **Le test B compare des niveaux**, en dollars, alors que nos prix sont
+   en SOL : le prix en dollars est reconstitue par `mcap_usd / supply`,
+   exactement la grandeur que l'experience 1 a validee a +15 min.
+
+### Budget
+
+`MAX_CREDITS = 100 000`, **cumule sur toutes les executions** de ce mode :
+la consommation precedente est relue dans `sol_run_log`, et des points de
+controle sont ecrits toutes les 50 unites — un run tue a la main
+n'ecrivant jamais son recapitulatif, ses credits seraient sinon
+invisibles. Sections plafonnees a 45 000 (section 1) et 40 000
+(section 3).
 
 ## La cloture : `RUN_MODE=exp1_close`
 

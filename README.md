@@ -43,6 +43,7 @@ Ce repo est construit par briques.
 | `exp1_close.py` | **Experience 1** : cloture, validation externe et regles de sortie |
 | `exp2_wallets.py` | **Experience 2** : les wallets apportent-ils quelque chose ? |
 | `exp2_diag.py` | Sonde jetable : pourquoi la section 1 n'a ecrit aucun achat |
+| `exp2_diag2.py` | Sonde jetable : que sont les transferts geants du pool ? |
 | `solana_addr.py` | base58 et derivation de PDA, sans dependance externe |
 
 ## Installation
@@ -58,7 +59,7 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7`, `exp1_window`, `exp1_matrix`, `exp1_matrix_v2`, `exp1_close`, `exp2_wallets`, `exp2_diag` |
+| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7`, `exp1_window`, `exp1_matrix`, `exp1_matrix_v2`, `exp1_close`, `exp2_wallets`, `exp2_diag`, `exp2_diag2` |
 | `FORCE_REMEASURE` | `true` pour refaire une mesure deja faite (voir plus bas) |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
@@ -78,6 +79,7 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 | `EXP2_GATE_SEED` | **Optionnelle**, `exp2_wallets` : graine du tirage de la porte (defaut **20260930**) |
 | `DIAG_CALLS` | **Optionnelle**, `exp2_diag` : plafond d'appels Helius (defaut **10**) |
 | `DIAG_SEED` | **Optionnelle**, `exp2_diag` : graine du tirage des tokens examines (defaut **20260928**) |
+| `DIAG2_CALLS` | **Optionnelle**, `exp2_diag2` : plafond d'appels RPC (defaut **6**) |
 | `EXP2_S3_CREDITS` | **Optionnelle**, `exp2_wallets` : plafond de la section 3 (defaut **40 000**) |
 | `STAGE1_SAMPLE` | **Optionnelle**, `exp1_window` : fraction des graduations mesurees en etape 1 (defaut **1.0**) |
 | `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v7` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
@@ -114,6 +116,7 @@ RUN_MODE=exp1_matrix_v2 python main.py # experience 1, unites corrigees + lectur
 RUN_MODE=exp1_close python main.py   # experience 1, cloture (CoinGecko seul)
 RUN_MODE=exp2_wallets python main.py # experience 2, les wallets
 RUN_MODE=exp2_diag    python main.py # pourquoi 0 achat en section 1 ?
+RUN_MODE=exp2_diag2   python main.py # que sont les transferts geants ?
 ```
 
 | `RUN_MODE` | Effet |
@@ -140,6 +143,7 @@ RUN_MODE=exp2_diag    python main.py # pourquoi 0 achat en section 1 ?
 | `exp1_close` | **experience 1** : cloture, **aucun appel Helius**, CoinGecko sous plafond |
 | `exp2_wallets` | **experience 2** : signal d'acheteur precoce, teste **hors echantillon** |
 | `exp2_diag` | **diagnostic** de la section 1, 10 appels Helius au plus, rien hors `sol_run_log` |
+| `exp2_diag2` | **diagnostic** des transferts geants, 6 appels RPC standard au plus |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -853,6 +857,55 @@ La sonde applique aussi, hors ligne et sans appel supplementaire, la
 regle corrigee sur les memes lignes : le recapitulatif montre cote a cote
 `achats, regle du 25/09` et `achats, regle corrigee`.
 
+### La cause, et ce qu'elle implique
+
+**Le filtre `mint` et l'exigence de jambe SOL s'excluent.** La reponse
+filtree ne contient QUE des lignes de ce mint : aucune jambe SOL ne peut
+partager la signature, et la condition `sol > 0` rejetait donc **tous**
+les groupes. Le filtre est conserve — il divise le volume lu par vingt —
+et l'exigence de jambe SOL disparait.
+
+Un achat devient : **une jambe du mint dont l'emetteur est le pool ou un
+de ses comptes de token, et dont le destinataire n'appartient pas au
+pool**. Les montants sont agreges par `(signature, destinataire)`.
+
+Sans contrepartie SOL, deux garde-fous de **taille** la remplacent :
+
+| Regle | Seuil | Traitement |
+| --- | --- | --- |
+| Poussiere | moins de **20 000 jetons** | ignore |
+| Transfert structurel | plus de **103 450 000 jetons**, soit la moitie du depot de migration (206,9 M) | pas un achat : journalise avec le token, le destinataire, le montant, sa part du depot et le fait que le destinataire soit ou non le signataire de la graduation, puis compte sur l'ensemble des tokens |
+
+`sol_engage` vaut desormais **NULL**. La colonne l'accepte (aucune
+contrainte `not null`), et l'ecriture de test du demarrage l'ecrit
+reellement a NULL : si la base la refusait, l'experience s'arreterait
+avant la moindre depense au lieu d'inventer un zero.
+
+Le montant en jetons n'est pas stocke : `sol_grad_buys` n'a pas de
+colonne pour lui. Il sert aux deux filtres ci-dessus et au journal.
+
+### Acheteurs precoces : les 100 premiers
+
+Les **100 premiers wallets distincts** de `[graduation ; +10 min]`, rangs
+1 a 100. La pagination s'arrete des le rang 100 atteint, et **3 pages au
+plus** par token : au-dela, ce ne sont plus des acheteurs precoces, et
+chaque page coute 10 credits.
+
+Deux comptes identifies par les diagnostics —
+`27HFmP7c…` et `8N4QDR8m…` — sont exclus **des l'extraction**, en plus de
+la regle « present dans plus de 10 % des tokens » de la section 2.
+
+### Le second diagnostic : `RUN_MODE=exp2_diag2`
+
+Trois transactions lues en entier (`getTransaction`, `jsonParsed`) et
+deux comptes identifies (`getAccountInfo`) : signataires, programmes
+invoques, noms d'instructions quand le parsing les donne, variations de
+SOL et de tokens par proprietaire, chacune exprimee en **part du depot de
+migration**. Les comptes connus de `sol_grad_paths` — pool, signataire de
+la graduation, mint, courbe — sont etiquetes **gratuitement**, sans
+appel. Plafond : **6 appels RPC standard**, aucune ecriture hors
+`sol_run_log`.
+
 ### Quatre corrections de la section 1
 
 1. **La signature n'etait cherchee qu'a la racine de la ligne.** Le module
@@ -871,7 +924,7 @@ regle corrigee sur les memes lignes : le recapitulatif montre cote a cote
    wallet a paye. Un token qui entre sans SOL sortant reste un non-achat.
 3. **Un wallet achetant deux fois dans la fenetre** voyait son montant
    **remplace** au lieu d'etre cumule des que le second achat etait
-   anterieur. Le SOL s'ajoute, la date recule.
+   anterieur. Les jetons s'ajoutent, la date recule.
 4. **La fenetre `[graduation ; +10 min]` est filtree cote serveur** et
    lue du plus ancien au plus recent : ce sont les **premiers** acheteurs
    qui interessent l'experience, et la troncature au plafond de pages ne
@@ -881,7 +934,7 @@ regle corrigee sur les memes lignes : le recapitulatif montre cote a cote
 
 | Garde-fou | Effet |
 | --- | --- |
-| Coupe-circuit, section 1 | au **20e token**, si le total d'achats est nul ou la **mediane par token < 3**, arret immediat : `MESURE VIDE` |
+| Coupe-circuit, section 1 | au **20e token**, si moins de **15 tokens** ont **10 acheteurs distincts** ou plus, arret immediat : `MESURE VIDE` |
 | Section 2, aucun achat | `MESURE VIDE - pas de verdict`, le placebo n'est pas calcule |
 | Section 2, moins de **30 wallets candidats** | `MESURE VIDE - pas de verdict` : on ne classe pas un top 30 avec moins de 30 |
 | « Aucun signal » | **interdit** tant que `placebo_calcule` n'est pas vrai ; une incoherence est levee sinon |

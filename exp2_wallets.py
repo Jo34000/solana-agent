@@ -53,9 +53,19 @@ Ecarts releves APRES le run du 25/09 a 09:23 (800 tokens, 32 290 credits,
      REMPLACE au lieu d'etre cumule, des que le second achat etait
      anterieur. Le SOL s'ajoute, la date recule.
   8. Une collecte vide n'est pas un resultat : un coupe-circuit arrete la
-     section 1 au 20e token si le total d'achats est nul ou la mediane
-     inferieure a 3, et la section 2 rend "MESURE VIDE - pas de verdict"
+     section 1 au 20e token si moins de 15 tokens ont 10 acheteurs
+     distincts, et la section 2 rend "MESURE VIDE - pas de verdict"
      plutot qu'"aucun signal" tant que le placebo n'a pas ete calcule.
+  9. LA CAUSE, etablie par le premier diagnostic : avec le filtre `mint`,
+     la reponse ne contient QUE des lignes de ce mint. Aucune jambe SOL
+     ne peut donc partager la signature, et la condition `sol > 0`
+     rejetait TOUS les groupes. Le filtre est conserve - il divise le
+     volume par vingt - et l'exigence de jambe SOL est supprimee :
+     un achat est une sortie du pool vers un wallet. En consequence
+     sol_engage vaut NULL, et deux garde-fous de taille remplacent la
+     contrepartie SOL : sous 20 000 jetons c'est de la poussiere,
+     au-dela de la moitie du depot de migration (103,45 M sur 206,9 M)
+     c'est un transfert structurel, journalise et compte a part.
 """
 
 from __future__ import annotations
@@ -116,7 +126,11 @@ MIN_VERDICT_N = 60
 GO_TOUCH_RATIO = 1.5
 BENCHMARK_SIZE = 400
 SAMPLE_TOKENS = 800
-BUY_MAX_PAGES = 5
+BUY_MAX_PAGES = 3
+# Acheteurs precoces = les 100 premiers wallets DISTINCTS de la fenetre.
+# La pagination s'arrete des le rang 100 : au-dela, ce ne sont plus des
+# acheteurs precoces, et chaque page coute 10 credits.
+MAX_BUYERS = 100
 WALLET_MAX_PAGES = 10
 BOT_SHARE = 0.10
 CHECKPOINT_EVERY = 50
@@ -124,7 +138,23 @@ CHECKPOINT_EVERY = 50
 # bug, pas un resultat. 800 tokens et 32 290 credits pour 0 achat ne se
 # reproduiront pas.
 CIRCUIT_TOKENS = 20
-CIRCUIT_MEDIAN = 3
+CIRCUIT_MIN_BUYERS = 10
+CIRCUIT_MIN_TOKENS = 15
+
+# Un transfert du pool n'est pas forcement un achat.
+#   - sous 20 000 jetons, c'est de la poussiere ;
+#   - au-dela de la moitie du depot de migration, c'est un mouvement
+#     structurel (retrait, redistribution), pas un achat de marche.
+# Le depot pump.fun vaut 206,9 M de jetons ; la moitie, 103,45 M.
+DUST_TOKENS = 20_000.0
+MIGRATION_DEPOSIT = 206_900_000.0
+STRUCTURAL_TOKENS = MIGRATION_DEPOSIT / 2
+
+# Deux comptes identifies par les diagnostics : ils recoivent du token
+# sur presque tous les pools. Exclus des l'EXTRACTION, en plus de la
+# regle "present dans plus de 10 % des tokens" de la section 2.
+KNOWN_ROUTERS = ("27HFmP7ccLadGswvQfvea4o3juLw75cPF4V6jWpHM3MX",
+                 "8N4QDR8m54PuV2KgHSu39QRHrNooNEK667hBeKVokZoc")
 
 IN_SAMPLE_DAYS = ("2026-09-11", "2026-09-12", "2026-09-13")
 OUT_SAMPLE_DAYS = ("2026-09-14", "2026-09-15", "2026-09-16")
@@ -148,7 +178,7 @@ CANDLE_SECONDS = 300
 
 EXCLUDED_PREFIXES = ("6EF8rrec", "pAMMBay6", "Tokenz", "Tokenkeg", "ATokenGP",
                      "ComputeB", "SysvarRe", "1111", "So1111", FEE_PREFIX,
-                     BACKUP_PREFIX)
+                     BACKUP_PREFIX) + KNOWN_ROUTERS
 
 CREDIT_COST = {
     "getTransfersByAddress": 10,
@@ -168,6 +198,7 @@ _section_cap = 0
 _budget_reached = False
 _mint_filter: bool | None = None
 _buy_reasons: Counter = Counter()
+_structurels: list[dict] = []
 _incoherences: list[str] = []
 _run_at = ""
 
@@ -398,9 +429,12 @@ def check_tables() -> bool:
         print(f"\n{RUN_LOG_TABLE} inutilisable : {error}")
         return False
     try:
+        # sol_engage vaut desormais NULL : plus de jambe SOL dans la
+        # reponse filtree par mint. L'ecriture de test le prouve AVANT
+        # la moindre depense, plutot que de s'en remettre au schema.
         db.upsert_grad_buys([{
             "mint": "__probe__", "wallet": "__probe__", "rang": 0,
-            "sol_engage": 0,
+            "sol_engage": None,
             "updated_at": datetime.now(timezone.utc).isoformat()}])
     except Exception as error:               # noqa: BLE001
         print(f"\n{GRAD_BUYS_TABLE} inutilisable : {error}")
@@ -777,22 +811,19 @@ def group_lines(lines: list[dict]) -> dict[str, list[dict]]:
 
 
 def buys_in_group(lines: list[dict], pool: str, mint: str,
-                  accounts: set[str]) -> list[dict]:
-    """Les achats d'une signature : qui recoit le mint contre du SOL.
+                  accounts: set[str], signer: str = "") -> list[dict]:
+    """Les achats d'une signature : qui sort du pool vers un wallet.
 
-    L'emetteur du mint est accepte sous TROIS formes, comptees separement :
-    le pool lui-meme, un compte de token du pool, ou - quand la ligne ne
-    nomme aucun proprietaire - la jambe SOL de la meme signature, qui dit
-    quel wallet a paye. Les trois sont des faits lus dans la reponse.
+    Plus aucune exigence de jambe SOL. Avec le filtre `mint`, la reponse
+    ne contient QUE des lignes de ce mint : aucune jambe SOL ne peut
+    partager la signature, et l'exiger revenait a tout rejeter. C'est la
+    cause du "0 achat" du 25/09.
+
+    Les montants sont agreges par (signature, destinataire) : une meme
+    transaction peut envoyer le token en plusieurs jambes.
     """
-    sol_out: dict[str, float] = defaultdict(float)
-    for line in lines:
-        if line.get("mint") in rules.SOL_MINTS:
-            sender = line.get("fromUserAccount")
-            if isinstance(sender, str):
-                sol_out[sender] += rules.amount_of(line, sol_leg=True)
-
-    found: list[dict] = []
+    totals: dict[str, float] = defaultdict(float)
+    when: dict[str, float] = {}
     for line in lines:
         if line.get("mint") != mint:
             continue
@@ -805,30 +836,56 @@ def buys_in_group(lines: list[dict], pool: str, mint: str,
         elif (isinstance(source, str) and source in accounts) or (
                 isinstance(account, str) and account in accounts):
             form = "emetteur = compte de token du pool"
-        elif isinstance(buyer, str) and sol_out.get(buyer, 0.0) > 0:
-            form = "emetteur inconnu, achat confirme par la jambe SOL"
         else:
-            _buy_reasons["REJET emetteur inconnu"] += 1
+            # La reponse ne contient que des lignes concernant le pool :
+            # un emetteur inconnu est donc un compte du pool que la
+            # reponse ne rattache a personne. On le compte a part.
+            form = "emetteur non rattache au pool"
+        if not isinstance(buyer, str):
+            _buy_reasons["REJET destinataire absent"] += 1
             continue
-        if not isinstance(buyer, str) or excluded_wallet(buyer, pool):
-            _buy_reasons["REJET destinataire exclu ou absent"] += 1
+        if buyer in accounts or buyer == pool:
+            _buy_reasons["REJET destinataire = pool (vente ou depot)"] += 1
             continue
-        sol = sol_out.get(buyer, 0.0)
-        if sol <= 0:
-            _buy_reasons["REJET sans jambe SOL"] += 1
+        if excluded_wallet(buyer, pool):
+            _buy_reasons["REJET destinataire exclu"] += 1
             continue
         _buy_reasons[form] += 1
-        found.append({"wallet": buyer, "sol": sol,
-                      "when": rules.line_time(line)})
+        totals[buyer] += rules.amount_of(line)
+        moment = rules.line_time(line)
+        if moment and (buyer not in when or moment < when[buyer]):
+            when[buyer] = moment
+
+    found: list[dict] = []
+    for buyer, amount in totals.items():
+        if amount < DUST_TOKENS:
+            _buy_reasons["REJET poussiere (< 20 000 jetons)"] += 1
+            continue
+        if amount > STRUCTURAL_TOKENS:
+            _buy_reasons["REJET transfert structurel"] += 1
+            _structurels.append({"mint": mint, "destinataire": buyer,
+                                 "montant": amount,
+                                 "part_depot": round(
+                                     amount / MIGRATION_DEPOSIT, 4),
+                                 "est_signataire": buyer == signer})
+            log.warning("Transfert structurel : %s recoit %.0f jetons de %s "
+                        "(%.0f %% du depot), signataire de graduation : %s",
+                        buyer[:12], amount, mint[:8],
+                        100 * amount / MIGRATION_DEPOSIT,
+                        "oui" if buyer == signer else "non")
+            continue
+        found.append({"wallet": buyer, "tokens": amount,
+                      "when": when.get(buyer, 0.0)})
     return found
 
 
-def buys_of(pool: str, mint: str, graduated: float) -> tuple[list[dict], str]:
-    """Achats du token sur son pool, de la graduation a +10 min.
+def buys_of(pool: str, mint: str, graduated: float,
+            signer: str = "") -> tuple[list[dict], str]:
+    """Les 100 premiers acheteurs du token, de la graduation a +10 min.
 
     Fenetre filtree COTE SERVEUR et lecture du plus ancien au plus recent :
-    ce sont les premiers acheteurs qui interessent l'experience, et la
-    troncature au plafond de pages ne coupe donc que la fin de la fenetre.
+    ce sont les premiers acheteurs qui interessent l'experience. La
+    pagination s'arrete des que 100 wallets distincts sont connus.
 
     filters.mint n'a jamais ete valide : un seul essai, puis filtrage du
     mint cote client si la cle est rejetee. Une cle inconnue ferait
@@ -872,27 +929,31 @@ def buys_of(pool: str, mint: str, graduated: float) -> tuple[list[dict], str]:
         _buy_reasons["lignes lues"] += len(rows)
         accounts |= pool_token_accounts(rows, pool)
         for lines in group_lines(rows).values():
-            for buy in buys_in_group(lines, pool, mint, accounts):
+            for buy in buys_in_group(lines, pool, mint, accounts, signer):
                 when = buy["when"] or graduated
                 entry = found.get(buy["wallet"])
                 if entry is None:
-                    found[buy["wallet"]] = {"first": when, "sol": buy["sol"]}
+                    if len(found) >= MAX_BUYERS:
+                        continue
+                    found[buy["wallet"]] = {"first": when,
+                                            "tokens": buy["tokens"]}
                 else:
                     # Un meme wallet peut acheter plusieurs fois dans la
-                    # fenetre : le SOL s'ajoute, la date recule.
-                    entry["sol"] += buy["sol"]
+                    # fenetre : les jetons s'ajoutent, la date recule.
+                    entry["tokens"] += buy["tokens"]
                     entry["first"] = min(entry["first"], when)
+        if len(found) >= MAX_BUYERS:
+            stopped = f"rang {MAX_BUYERS} atteint"
+            break
         page_token = next_page_token(payload)
         if not page_token:
             break
     else:
         stopped = f"plafond de {BUY_MAX_PAGES} pages"
-        log.warning("Token %s : %d pages atteintes, acheteurs tronques",
-                    mint[:8], BUY_MAX_PAGES)
 
     ordered = sorted(found.items(), key=lambda item: item[1]["first"])
-    return ([{"wallet": wallet, "first": data["first"], "sol": data["sol"],
-              "rang": rank}
+    return ([{"wallet": wallet, "first": data["first"],
+              "tokens": data["tokens"], "rang": rank}
              for rank, (wallet, data) in enumerate(ordered, start=1)],
             stopped)
 
@@ -925,7 +986,8 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
         if not can_spend("getTransfersByAddress"):
             stopped = "plafond"
             break
-        buys, note = buys_of(row["pool"], row["mint"], _grad_at(row))
+        buys, note = buys_of(row["pool"], row["mint"], _grad_at(row),
+                             row.get("signer") or "")
         if "pages" in note:
             truncated += 1
         if "PERTE" in note or "plafond de credits" in note:
@@ -938,22 +1000,26 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
                 "mint": row["mint"], "wallet": buy["wallet"],
                 "jour": row.get("jour"),
                 "first_buy_at": _iso(buy["first"]),
-                "sol_engage": round(buy["sol"], 9), "rang": buy["rang"],
+                # Plus de jambe SOL dans une reponse filtree par mint :
+                # la colonne est laissee VIDE plutot que remplie d'un
+                # zero qui se lirait comme un achat sans contrepartie.
+                "sol_engage": None, "rang": buy["rang"],
                 "updated_at": datetime.now(timezone.utc).isoformat()}
                 for buy in buys])
             buyers_total += len(buys)
         written += 1
         per_token.append(len(buys))
         if len(per_token) == CIRCUIT_TOKENS:
-            median = statistics.median(per_token)
-            if buyers_total == 0 or median < CIRCUIT_MEDIAN:
+            fournis = sum(1 for count in per_token
+                          if count >= CIRCUIT_MIN_BUYERS)
+            if fournis < CIRCUIT_MIN_TOKENS:
                 stopped = "MESURE VIDE"
                 checkpoint("1", written)
-                log.error("MESURE VIDE : %d achat(s) sur %d tokens, mediane "
-                          "%.1f par token (seuil %d). Arret : une collecte "
-                          "qui ne rapporte rien est un bug, pas un "
-                          "resultat.", buyers_total, CIRCUIT_TOKENS, median,
-                          CIRCUIT_MEDIAN)
+                log.error("MESURE VIDE : %d token(s) sur %d ont au moins %d "
+                          "acheteurs distincts, il en faut %d. Arret : une "
+                          "collecte qui ne rapporte rien est un bug, pas un "
+                          "resultat.", fournis, CIRCUIT_TOKENS,
+                          CIRCUIT_MIN_BUYERS, CIRCUIT_MIN_TOKENS)
                 break
         if index % CHECKPOINT_EVERY == 0:
             checkpoint("1", written)
@@ -962,11 +1028,20 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
     checkpoint("1", written)
 
     median = statistics.median(per_token) if per_token else 0.0
+    fournis = sum(1 for count in per_token if count >= CIRCUIT_MIN_BUYERS)
     print(f"\n  {written} token(s) collectes, {buyers_total} achat(s) ecrits "
           f"({stopped})")
     print(f"  achats par token : mediane {median:.1f}, maximum "
           f"{max(per_token) if per_token else 0}")
+    print(f"  tokens avec au moins {CIRCUIT_MIN_BUYERS} acheteurs : "
+          f"{fournis}/{len(per_token)}")
     print(f"  tokens tronques au plafond de pages : {truncated}")
+    print(f"  transferts structurels ecartes : {len(_structurels)}")
+    for case in _structurels[:5]:
+        print(f"    {case['mint'][:8]}.. -> {case['destinataire'][:12]}.. "
+              f"{case['montant']:,.0f} jetons ({case['part_depot']:.0%} du "
+              f"depot) | signataire de graduation : "
+              f"{'oui' if case['est_signataire'] else 'non'}")
     print(f"  cle `mint` : "
           f"{'acceptee' if _mint_filter else 'rejetee, filtrage client'}")
     print("  formes d'achat et rejets :")
@@ -978,6 +1053,9 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
     return {"population": len(population), "echantillon": len(sample),
             "collectes": written, "achats": buyers_total,
             "achats_par_token_median": median,
+            "tokens_fournis": fournis,
+            "structurels": len(_structurels),
+            "structurels_detail": _structurels[:50],
             "tronques": truncated, "arret": stopped,
             "mesure_vide": stopped == "MESURE VIDE",
             "raisons": dict(_buy_reasons),

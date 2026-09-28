@@ -33,6 +33,29 @@ Ecarts releves AVANT ecriture, et ce qui a ete decide :
      et les bougies en USD. Le prix en dollars est donc reconstitue par
      mcap_usd / supply, ce qui est exactement la grandeur validee a
      +15 min par l'experience 1.
+
+Ecarts releves APRES le run du 25/09 a 09:23 (800 tokens, 32 290 credits,
+0 achat ecrit, et un "aucun signal" affiche sans placebo) :
+
+  5. Le groupement par signature n'acceptait QUE la racine de la ligne,
+     alors que le module rules expose extract_signature precisement parce
+     qu'une ligne brute ne la porte pas toujours la. Une ligne sans
+     signature racine disparaissait sans erreur : 0 achat sur 800 tokens
+     etait affiche comme un resultat. Le groupement passe par
+     extract_signature et compte le chemin reellement emprunte.
+  6. L'emetteur du mint etait compare au POOL seul. Un pool AMM envoie
+     ses tokens depuis un compte de token qui lui appartient : la
+     comparaison ne pouvait pas etre vraie. Trois formes sont desormais
+     acceptees et comptees separement - le pool, un compte de token dont
+     une ligne dit qu'il appartient au pool, et, a defaut de proprietaire
+     nomme, la jambe SOL de la meme signature qui dit quel wallet a paye.
+  7. Un meme wallet achetant deux fois dans la fenetre voyait son montant
+     REMPLACE au lieu d'etre cumule, des que le second achat etait
+     anterieur. Le SOL s'ajoute, la date recule.
+  8. Une collecte vide n'est pas un resultat : un coupe-circuit arrete la
+     section 1 au 20e token si le total d'achats est nul ou la mediane
+     inferieure a 3, et la section 2 rend "MESURE VIDE - pas de verdict"
+     plutot qu'"aucun signal" tant que le placebo n'a pas ete calcule.
 """
 
 from __future__ import annotations
@@ -65,7 +88,7 @@ RUN_MODE = "exp2_wallets"
 BACKUP_PREFIX = "39azUYFW"
 FEE_PREFIX = "9C4nRvhh"
 
-MAX_CREDITS = exp._env_int("MAX_CREDITS", 100_000)
+MAX_CREDITS = exp._env_int("MAX_CREDITS", 120_000)
 SECTION1_CREDITS = exp._env_int("EXP2_S1_CREDITS", 45_000)
 SECTION3_CREDITS = exp._env_int("EXP2_S3_CREDITS", 40_000)
 GATE_CALLS = exp._env_int("EXP2_GATE_CALLS", 35)
@@ -83,6 +106,9 @@ EXITS = ("2 h", "3 h")
 TOUCH_LEVEL = 2.0
 MIN_TOKENS_PER_WALLET = 5
 TOP_WALLETS = 30
+# Moins de 30 candidats, ce n'est pas un classement : c'est une mesure
+# vide. Le run du 25/09 en avait zero et a pourtant affiche un verdict.
+MIN_CANDIDATES = TOP_WALLETS
 SCORE_PRIOR = 10.0
 PLACEBO_RUNS = 200
 PLACEBO_PERCENTILE = 0.95
@@ -94,6 +120,11 @@ BUY_MAX_PAGES = 5
 WALLET_MAX_PAGES = 10
 BOT_SHARE = 0.10
 CHECKPOINT_EVERY = 50
+# Coupe-circuit : au 20e token, une collecte qui ne rapporte rien est un
+# bug, pas un resultat. 800 tokens et 32 290 credits pour 0 achat ne se
+# reproduiront pas.
+CIRCUIT_TOKENS = 20
+CIRCUIT_MEDIAN = 3
 
 IN_SAMPLE_DAYS = ("2026-09-11", "2026-09-12", "2026-09-13")
 OUT_SAMPLE_DAYS = ("2026-09-14", "2026-09-15", "2026-09-16")
@@ -136,6 +167,7 @@ _section_start = 0
 _section_cap = 0
 _budget_reached = False
 _mint_filter: bool | None = None
+_buy_reasons: Counter = Counter()
 _incoherences: list[str] = []
 _run_at = ""
 
@@ -517,6 +549,29 @@ def band_of(candles: list[list], moment: float,
     return min(lows) * GATE_BAND_LOW, max(highs) * GATE_BAND_HIGH
 
 
+def gate_already_open() -> dict | None:
+    """Une porte deja ouverte est un acquis : on ne la repaye pas.
+
+    Le run du 25/09 a 09:23 l'a ouverte a 20/20 et 41/41 points. Relire
+    ce verdict coute zero appel ; le refaire en coute 35.
+    """
+    try:
+        rows = db.fetch_run_log(RUN_MODE, "0", 5)
+    except Exception as error:               # noqa: BLE001
+        log.warning("Relecture des portes precedentes impossible (%s) : la "
+                    "section 0 va etre refaite", error)
+        return None
+    for row in rows:
+        payload = row.get("payload") or {}
+        if payload.get("porte"):
+            print(f"\n  PORTE DEJA OUVERTE le {row.get('run_at')} : "
+                  f"{payload.get('test_b')}/{payload.get('testes')} tokens, "
+                  f"{payload.get('points_dedans')}/{payload.get('points')} "
+                  f"points. Section 0 sautee, aucun appel CoinGecko.")
+            return payload
+    return None
+
+
 def section_0(rows: list[dict]) -> dict:
     start_section("0", "Porte : validation des prix (CoinGecko seul)")
     print(f"  {GATE_CALLS} appels au plus, pause {PAUSE_S} s | porte a "
@@ -682,8 +737,98 @@ def excluded_wallet(wallet: str, pool: str) -> bool:
     return any(wallet.startswith(prefix) for prefix in EXCLUDED_PREFIXES)
 
 
+def pool_token_accounts(lines: list[dict], pool: str) -> set[str]:
+    """Comptes de token dont une ligne DIT que le pool est proprietaire.
+
+    Rien n'est devine : un compte n'entre ici que si une ligne porte le
+    pool en `fromUserAccount` ou `toUserAccount` a cote de lui.
+    """
+    accounts = {pool}
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        if line.get("fromUserAccount") == pool and line.get(
+                "fromTokenAccount"):
+            accounts.add(line["fromTokenAccount"])
+        if line.get("toUserAccount") == pool and line.get("toTokenAccount"):
+            accounts.add(line["toTokenAccount"])
+    return accounts
+
+
+def group_lines(lines: list[dict]) -> dict[str, list[dict]]:
+    """Groupement par signature, OU QU'ELLE SOIT dans la ligne.
+
+    rules.group_by_signature n'accepte que la racine. Le run du 25/09 a
+    ecrit 0 achat sur 800 tokens sans une seule erreur : une ligne dont la
+    signature se trouve ailleurs disparaissait en silence. Le chemin
+    reellement utilise est compte, pour qu'un changement de forme se voie.
+    """
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        signature, path = rules.extract_signature(line)
+        if not signature:
+            _buy_reasons["ligne sans signature"] += 1
+            continue
+        _buy_reasons["signature via " + path] += 1
+        groups[signature].append(line)
+    return groups
+
+
+def buys_in_group(lines: list[dict], pool: str, mint: str,
+                  accounts: set[str]) -> list[dict]:
+    """Les achats d'une signature : qui recoit le mint contre du SOL.
+
+    L'emetteur du mint est accepte sous TROIS formes, comptees separement :
+    le pool lui-meme, un compte de token du pool, ou - quand la ligne ne
+    nomme aucun proprietaire - la jambe SOL de la meme signature, qui dit
+    quel wallet a paye. Les trois sont des faits lus dans la reponse.
+    """
+    sol_out: dict[str, float] = defaultdict(float)
+    for line in lines:
+        if line.get("mint") in rules.SOL_MINTS:
+            sender = line.get("fromUserAccount")
+            if isinstance(sender, str):
+                sol_out[sender] += rules.amount_of(line, sol_leg=True)
+
+    found: list[dict] = []
+    for line in lines:
+        if line.get("mint") != mint:
+            continue
+        _buy_reasons["jambe du mint"] += 1
+        buyer = line.get("toUserAccount")
+        source = line.get("fromUserAccount")
+        account = line.get("fromTokenAccount")
+        if source == pool:
+            form = "emetteur = pool"
+        elif (isinstance(source, str) and source in accounts) or (
+                isinstance(account, str) and account in accounts):
+            form = "emetteur = compte de token du pool"
+        elif isinstance(buyer, str) and sol_out.get(buyer, 0.0) > 0:
+            form = "emetteur inconnu, achat confirme par la jambe SOL"
+        else:
+            _buy_reasons["REJET emetteur inconnu"] += 1
+            continue
+        if not isinstance(buyer, str) or excluded_wallet(buyer, pool):
+            _buy_reasons["REJET destinataire exclu ou absent"] += 1
+            continue
+        sol = sol_out.get(buyer, 0.0)
+        if sol <= 0:
+            _buy_reasons["REJET sans jambe SOL"] += 1
+            continue
+        _buy_reasons[form] += 1
+        found.append({"wallet": buyer, "sol": sol,
+                      "when": rules.line_time(line)})
+    return found
+
+
 def buys_of(pool: str, mint: str, graduated: float) -> tuple[list[dict], str]:
     """Achats du token sur son pool, de la graduation a +10 min.
+
+    Fenetre filtree COTE SERVEUR et lecture du plus ancien au plus recent :
+    ce sont les premiers acheteurs qui interessent l'experience, et la
+    troncature au plafond de pages ne coupe donc que la fin de la fenetre.
 
     filters.mint n'a jamais ete valide : un seul essai, puis filtrage du
     mint cote client si la cle est rejetee. Une cle inconnue ferait
@@ -693,6 +838,7 @@ def buys_of(pool: str, mint: str, graduated: float) -> tuple[list[dict], str]:
     window = {"blockTime": {"gte": int(graduated),
                             "lte": int(graduated + SIGNAL_WINDOW_S)}}
     found: dict[str, dict] = {}
+    accounts: set[str] = {pool}
     page_token = None
     stopped = "fenetre couverte"
 
@@ -723,28 +869,19 @@ def buys_of(pool: str, mint: str, graduated: float) -> tuple[list[dict], str]:
             break
         if not rows:
             break
-        for signature, lines in rules.group_by_signature(rows).items():
-            sol = 0.0
-            buyer = None
-            when = 0.0
-            for line in lines:
-                line_mint = line.get("mint")
-                if line_mint in rules.SOL_MINTS:
-                    sol += rules.amount_of(line, sol_leg=True)
-                elif line_mint == mint:
-                    destination = line.get("toUserAccount")
-                    source = line.get("fromUserAccount")
-                    if source == pool and isinstance(destination, str):
-                        buyer = destination
-                        when = max(when, rules.line_time(line))
-            if not buyer or sol <= 0 or excluded_wallet(buyer, pool):
-                continue
-            entry = found.get(buyer)
-            if entry is None or when < entry["first"]:
-                found[buyer] = {"first": when or graduated,
-                                "sol": sol, "signature": signature}
-            else:
-                entry["sol"] += sol
+        _buy_reasons["lignes lues"] += len(rows)
+        accounts |= pool_token_accounts(rows, pool)
+        for lines in group_lines(rows).values():
+            for buy in buys_in_group(lines, pool, mint, accounts):
+                when = buy["when"] or graduated
+                entry = found.get(buy["wallet"])
+                if entry is None:
+                    found[buy["wallet"]] = {"first": when, "sol": buy["sol"]}
+                else:
+                    # Un meme wallet peut acheter plusieurs fois dans la
+                    # fenetre : le SOL s'ajoute, la date recule.
+                    entry["sol"] += buy["sol"]
+                    entry["first"] = min(entry["first"], when)
         page_token = next_page_token(payload)
         if not page_token:
             break
@@ -783,6 +920,7 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
     buyers_total = 0
     truncated = 0
     stopped = "termine"
+    per_token: list[int] = []
     for index, row in enumerate(todo, start=1):
         if not can_spend("getTransfersByAddress"):
             stopped = "plafond"
@@ -805,20 +943,44 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
                 for buy in buys])
             buyers_total += len(buys)
         written += 1
+        per_token.append(len(buys))
+        if len(per_token) == CIRCUIT_TOKENS:
+            median = statistics.median(per_token)
+            if buyers_total == 0 or median < CIRCUIT_MEDIAN:
+                stopped = "MESURE VIDE"
+                checkpoint("1", written)
+                log.error("MESURE VIDE : %d achat(s) sur %d tokens, mediane "
+                          "%.1f par token (seuil %d). Arret : une collecte "
+                          "qui ne rapporte rien est un bug, pas un "
+                          "resultat.", buyers_total, CIRCUIT_TOKENS, median,
+                          CIRCUIT_MEDIAN)
+                break
         if index % CHECKPOINT_EVERY == 0:
             checkpoint("1", written)
             log.info("  section 1 : %d/%d tokens, %d credits", written,
                      len(todo), _credits)
     checkpoint("1", written)
 
+    median = statistics.median(per_token) if per_token else 0.0
     print(f"\n  {written} token(s) collectes, {buyers_total} achat(s) ecrits "
           f"({stopped})")
+    print(f"  achats par token : mediane {median:.1f}, maximum "
+          f"{max(per_token) if per_token else 0}")
     print(f"  tokens tronques au plafond de pages : {truncated}")
     print(f"  cle `mint` : "
           f"{'acceptee' if _mint_filter else 'rejetee, filtrage client'}")
+    print("  formes d'achat et rejets :")
+    for label, count in sorted(_buy_reasons.items(), key=lambda kv: -kv[1]):
+        print(f"    {label:<48} {count}")
+    if stopped == "MESURE VIDE":
+        print("  MESURE VIDE : la collecte ne rapporte rien. Aucun verdict "
+              "ne sera rendu sur ces donnees.")
     return {"population": len(population), "echantillon": len(sample),
             "collectes": written, "achats": buyers_total,
+            "achats_par_token_median": median,
             "tronques": truncated, "arret": stopped,
+            "mesure_vide": stopped == "MESURE VIDE",
+            "raisons": dict(_buy_reasons),
             "mint_filter": _mint_filter,
             "credits": _credits - _section_start}
 
@@ -842,14 +1004,19 @@ def section_2(rows: list[dict], rng: random.Random,
     except Exception as error:               # noqa: BLE001
         log.error("PERTE : relecture de %s impossible : %s", GRAD_BUYS_TABLE,
                   error)
-        return {}
+        return {"mesure_vide": True,
+                "raison": f"PERTE : relecture de {GRAD_BUYS_TABLE} "
+                          f"impossible ({error})"}
     buys = [b for b in buys if b.get("mint") in by_mint
             and b.get("wallet") not in (None, "__probe__")]
     tokens = {b["mint"] for b in buys}
     print(f"  {len(buys)} achat(s) sur {len(tokens)} token(s)")
     if not tokens:
-        print("  aucun achat : section interrompue")
-        return {}
+        print("  MESURE VIDE - pas de verdict : aucun achat en base pour "
+              "l'echantillon. Le placebo n'est pas calcule, et rien ne "
+              "permet de dire qu'il n'y a pas de signal.")
+        return {"mesure_vide": True, "achats": 0,
+                "raison": "aucun achat en base pour l'echantillon"}
 
     per_wallet: dict[str, set[str]] = defaultdict(set)
     for buy in buys:
@@ -884,10 +1051,15 @@ def section_2(rows: list[dict], rng: random.Random,
         if wallet not in bots and len(mints) >= MIN_TOKENS_PER_WALLET}
     print(f"  candidats (>= {MIN_TOKENS_PER_WALLET} tokens distincts) : "
           f"{len(candidates)}")
-    if not candidates:
-        print("  aucun candidat : section interrompue")
-        return {"bots": len(bots), "base": base, "candidats": 0,
-            "tokens_tires": population}
+    if len(candidates) < MIN_CANDIDATES:
+        print(f"  MESURE VIDE - pas de verdict : {len(candidates)} wallet(s) "
+              f"candidat(s), il en faut {MIN_CANDIDATES} pour classer un "
+              f"top {TOP_WALLETS}. Le placebo n'est pas calcule.")
+        return {"mesure_vide": True, "bots": len(bots),
+                "base": round(base, 5), "candidats": len(candidates),
+                "tokens_tires": population,
+                "raison": f"{len(candidates)} candidats pour "
+                          f"{MIN_CANDIDATES} demandes"}
 
     ranked = []
     for wallet, mints in candidates.items():
@@ -945,7 +1117,8 @@ def section_2(rows: list[dict], rng: random.Random,
     coherent("placebo calcule", len(placebo_scores) == PLACEBO_RUNS,
              f"{len(placebo_scores)} permutations")
 
-    return {"bots": len(bots), "base": round(base, 5),
+    return {"placebo_calcule": True, "mesure_vide": False,
+            "bots": len(bots), "base": round(base, 5),
             "tokens_tires": population,
             "candidats": len(candidates), "retenus": top,
             "score_observe": round(observed, 5),
@@ -1323,8 +1496,12 @@ def main() -> None:
 
     rng = random.Random(RANDOM_SEED)
     results: dict[str, Any] = {}
-    results["0"] = section_0(in_sample)
-    log_run("0", "porte", results["0"])
+    acquired = gate_already_open()
+    if acquired:
+        results["0"] = acquired
+    else:
+        results["0"] = section_0(in_sample)
+        log_run("0", "porte", results["0"])
     if not results["0"].get("porte"):
         print("\nARRET : la porte est fermee, aucun appel Helius n'a ete "
               "fait.")
@@ -1333,14 +1510,33 @@ def main() -> None:
 
     results["1"] = section_1(in_sample, rng)
     log_run("1", "acheteurs precoces", results["1"])
+    if results["1"].get("mesure_vide"):
+        print("\nARRET : MESURE VIDE - la collecte ne rapporte rien "
+              f"({results['1'].get('achats', 0)} achat(s) sur "
+              f"{results['1'].get('collectes', 0)} tokens). Ce n'est pas un "
+              "resultat : aucun verdict n'est rendu.")
+        log_run("run", "arret", {"raison": "mesure vide en section 1",
+                                 "raisons": results["1"].get("raisons")})
+        return
 
     results["2"] = section_2(in_sample, rng,
                              results["1"].get("echantillon", 0))
     log_run("2", "selection", results["2"])
+    if results["2"].get("mesure_vide"):
+        print("\nARRET : MESURE VIDE - pas de verdict "
+              f"({results['2'].get('raison', 'raison non precisee')}). "
+              "Le placebo n'a pas ete calcule : rien ne permet de dire "
+              "qu'il n'y a pas de signal.")
+        log_run("run", "arret", {"raison": "mesure vide en section 2",
+                                 "detail": results["2"].get("raison")})
+        return
+    coherent("un verdict de placebo suppose un placebo calcule",
+             bool(results["2"].get("placebo_calcule")),
+             "section 2 sans placebo")
     if not results["2"].get("signal"):
-        print("\nARRET : aucun signal en echantillon, le placebo n'est pas "
-              "battu. Rien ne justifie de depenser pour le hors "
-              "echantillon.")
+        print("\nARRET : aucun signal en echantillon, le placebo a ete "
+              "calcule et n'est pas battu. Rien ne justifie de depenser "
+              "pour le hors echantillon.")
         log_run("run", "arret", {"raison": "placebo non battu"})
         return
 

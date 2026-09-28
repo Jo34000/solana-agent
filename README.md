@@ -42,6 +42,7 @@ Ce repo est construit par briques.
 | `exp1_matrix_v2.py` | **Experience 1** : unites corrigees, creux, frais, conditionnements |
 | `exp1_close.py` | **Experience 1** : cloture, validation externe et regles de sortie |
 | `exp2_wallets.py` | **Experience 2** : les wallets apportent-ils quelque chose ? |
+| `exp2_diag.py` | Sonde jetable : pourquoi la section 1 n'a ecrit aucun achat |
 | `solana_addr.py` | base58 et derivation de PDA, sans dependance externe |
 
 ## Installation
@@ -57,7 +58,7 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 
 | Variable | Usage |
 | --- | --- |
-| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7`, `exp1_window`, `exp1_matrix`, `exp1_matrix_v2`, `exp1_close`, `exp2_wallets` |
+| `RUN_MODE` | `idle` (defaut), `winners`, `discovery`, `validation`, `validation_v2`, `validation_v3`, `probe`, `probe_helius`, `probe_transfers`, `probe_universe`, `probe_universe_v2`, `probe_universe_v3`, `probe_universe_v4`, `probe_universe_v5`, `probe_universe_v6`, `probe_universe_v7`, `exp1_window`, `exp1_matrix`, `exp1_matrix_v2`, `exp1_close`, `exp2_wallets`, `exp2_diag` |
 | `FORCE_REMEASURE` | `true` pour refaire une mesure deja faite (voir plus bas) |
 | `COINGECKO_API_KEY` | Cle Demo CoinGecko, envoyee en header `x-cg-demo-api-key` |
 | `HELIUS_API_KEY` | Cle Helius — requise par `discovery`, `validation`, `probe_helius` |
@@ -75,6 +76,8 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 | `EXP2_S1_CREDITS` | **Optionnelle**, `exp2_wallets` : plafond de la section 1 (defaut **45 000**) |
 | `EXP2_GATE_CALLS` | **Optionnelle**, `exp2_wallets` : plafond d'appels CoinGecko de la porte (defaut **35**) |
 | `EXP2_GATE_SEED` | **Optionnelle**, `exp2_wallets` : graine du tirage de la porte (defaut **20260930**) |
+| `DIAG_CALLS` | **Optionnelle**, `exp2_diag` : plafond d'appels Helius (defaut **10**) |
+| `DIAG_SEED` | **Optionnelle**, `exp2_diag` : graine du tirage des tokens examines (defaut **20260928**) |
 | `EXP2_S3_CREDITS` | **Optionnelle**, `exp2_wallets` : plafond de la section 3 (defaut **40 000**) |
 | `STAGE1_SAMPLE` | **Optionnelle**, `exp1_window` : fraction des graduations mesurees en etape 1 (defaut **1.0**) |
 | `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v7` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
@@ -110,6 +113,7 @@ RUN_MODE=exp1_matrix python main.py  # experience 1, matrice (aucun appel API)
 RUN_MODE=exp1_matrix_v2 python main.py # experience 1, unites corrigees + lecture fine
 RUN_MODE=exp1_close python main.py   # experience 1, cloture (CoinGecko seul)
 RUN_MODE=exp2_wallets python main.py # experience 2, les wallets
+RUN_MODE=exp2_diag    python main.py # pourquoi 0 achat en section 1 ?
 ```
 
 | `RUN_MODE` | Effet |
@@ -135,6 +139,7 @@ RUN_MODE=exp2_wallets python main.py # experience 2, les wallets
 | `exp1_matrix_v2` | **experience 1** : unites corrigees puis lecture fine, `getTokenSupply` seul |
 | `exp1_close` | **experience 1** : cloture, **aucun appel Helius**, CoinGecko sous plafond |
 | `exp2_wallets` | **experience 2** : signal d'acheteur precoce, teste **hors echantillon** |
+| `exp2_diag` | **diagnostic** de la section 1, 10 appels Helius au plus, rien hors `sol_run_log` |
 | autre valeur | erreur explicite au demarrage, pas de repli silencieux |
 
 > **Railway** : la Start Command doit etre `python main.py`. Lancer
@@ -827,14 +832,73 @@ faux.
    en SOL : le prix en dollars est reconstitue par `mcap_usd / supply`,
    exactement la grandeur que l'experience 1 a validee a +15 min.
 
+### Le run du 25/09 a 09:23, et ce qu'il a appris
+
+800 tokens lus, 32 290 credits depenses, 547 tokens tronques au plafond de
+pages... et **aucun achat ecrit**. Puis un « aucun signal en echantillon,
+le placebo n'est pas battu » — alors que le placebo n'avait jamais ete
+calcule. Une ligne de correction est ecrite dans `sol_run_log`
+(`exp2_wallets` / section 2) : *section 2 invalide (0 achat) : mesure
+vide, pas un verdict*.
+
+`RUN_MODE=exp2_diag` refait la requete de la section 1 **exactement comme
+elle etait codee** (la config est recopiee dans la sonde, pas importee,
+pour que la correction ne change pas ce qu'on mesure) sur trois tokens —
+un tronque, deux non tronques — et compte, a chaque etage du filtre,
+combien de lignes survivent. **La cause est le premier etage ou il n'en
+reste aucune**, et elle est nommee dans le journal. Plafond : 10 appels
+Helius, aucune ecriture hors `sol_run_log`.
+
+La sonde applique aussi, hors ligne et sans appel supplementaire, la
+regle corrigee sur les memes lignes : le recapitulatif montre cote a cote
+`achats, regle du 25/09` et `achats, regle corrigee`.
+
+### Quatre corrections de la section 1
+
+1. **La signature n'etait cherchee qu'a la racine de la ligne.** Le module
+   `graduations` expose `extract_signature` precisement parce qu'une ligne
+   brute ne la porte pas toujours la ; la section 1 utilisait
+   `group_by_signature`, qui n'accepte que la racine. Une ligne dont la
+   signature est ailleurs disparaissait **sans erreur**. Le groupement
+   passe par `extract_signature` et **compte le chemin** reellement
+   emprunte.
+2. **L'emetteur du mint etait compare au pool seul.** Un pool AMM envoie
+   ses tokens depuis un **compte de token qui lui appartient** : la
+   comparaison ne pouvait pas etre vraie. Trois formes sont desormais
+   acceptees et **comptees separement** — le pool lui-meme, un compte de
+   token dont une ligne dit qu'il appartient au pool, et, a defaut de
+   proprietaire nomme, la **jambe SOL de la meme signature**, qui dit quel
+   wallet a paye. Un token qui entre sans SOL sortant reste un non-achat.
+3. **Un wallet achetant deux fois dans la fenetre** voyait son montant
+   **remplace** au lieu d'etre cumule des que le second achat etait
+   anterieur. Le SOL s'ajoute, la date recule.
+4. **La fenetre `[graduation ; +10 min]` est filtree cote serveur** et
+   lue du plus ancien au plus recent : ce sont les **premiers** acheteurs
+   qui interessent l'experience, et la troncature au plafond de pages ne
+   coupe donc que la fin de la fenetre.
+
+### Une mesure vide n'est pas un verdict
+
+| Garde-fou | Effet |
+| --- | --- |
+| Coupe-circuit, section 1 | au **20e token**, si le total d'achats est nul ou la **mediane par token < 3**, arret immediat : `MESURE VIDE` |
+| Section 2, aucun achat | `MESURE VIDE - pas de verdict`, le placebo n'est pas calcule |
+| Section 2, moins de **30 wallets candidats** | `MESURE VIDE - pas de verdict` : on ne classe pas un top 30 avec moins de 30 |
+| « Aucun signal » | **interdit** tant que `placebo_calcule` n'est pas vrai ; une incoherence est levee sinon |
+
+### La porte ne se repaye pas
+
+La porte du 25/09 s'est ouverte a **20/20 tokens et 41/41 points**. Si
+`sol_run_log` contient une porte ouverte pour ce mode, la section 0 est
+**sautee** : relire ce verdict coute zero appel, le refaire en coute 35.
+
 ### Budget
 
-`MAX_CREDITS = 100 000`, **cumule sur toutes les executions** de ce mode :
-la consommation precedente est relue dans `sol_run_log`, et des points de
-controle sont ecrits toutes les 50 unites — un run tue a la main
-n'ecrivant jamais son recapitulatif, ses credits seraient sinon
-invisibles. Sections plafonnees a 45 000 (section 1) et 40 000
-(section 3).
+`MAX_CREDITS = 120 000`, **cumule sur toutes les executions** de ce mode :
+la consommation precedente est relue dans `sol_run_log` — les 32 290
+credits du 25/09 comptent — et des points de controle sont ecrits toutes
+les 50 unites, un run tue a la main n'ecrivant jamais son recapitulatif.
+Sections plafonnees a 45 000 (section 1) et 40 000 (section 3).
 
 ## La cloture : `RUN_MODE=exp1_close`
 

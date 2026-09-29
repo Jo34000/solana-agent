@@ -74,6 +74,18 @@ Ecarts releves APRES le run du 25/09 a 09:23 (800 tokens, 32 290 credits,
      signature peut servir un achat geant ET un achat d'environ 1 SOL
      vers un autre wallet (cas 8E6K), TOUS les destinataires de cette
      signature sortent du rang, pas seulement le geant.
+ 11. Le plancher en JETONS rejetait presque tout : 3 474 achats sur
+     3 639. Apres l'achat geant, qui touche 19 tokens sur 20, le prix
+     est multiplie par ~180 et 1 SOL n'achete plus que ~13 000 jetons.
+     Le plancher est donc en SOL (0,01), et le cout de chaque achat est
+     ESTIME en reconstituant les reserves du pool : etat initial commun
+     a tous les pools pump.fun, 206,9 M de jetons contre 85,16 SOL, puis
+     produit constant k = S0 x R0. La reserve est mise a jour par TOUS
+     les flux, y compris ceux dont l'achat est rejete. Un token dont la
+     premiere entree n'est pas le depot est dit a "reserve inconnue" :
+     exclu et compte, jamais devine. Le modele est CONTROLE sur trois
+     achats du premier token contre la variation reelle de WSOL du pool,
+     et un ecart de plus de 5 % arrete la collecte.
 """
 
 from __future__ import annotations
@@ -121,6 +133,7 @@ RANDOM_SEED = exp._env_int("RANDOM_SEED", 20260929)
 # qu'un redemarrage de conteneur ne repaye pas ce qui est en base.
 FORCE_RERUN = os.environ.get("FORCE_RERUN", "").strip().lower() in (
     "1", "true", "yes", "oui")
+DEPLOYMENT_ID = os.environ.get("RAILWAY_DEPLOYMENT_ID", "").strip()
 
 ENTRY_MCAP_USD = 60_000.0
 SIGNAL_WINDOW_S = 600            # graduation -> +10 min
@@ -155,16 +168,34 @@ CIRCUIT_MIN_BUYERS = 10
 CIRCUIT_MIN_TOKENS = 15
 
 # Un transfert du pool n'est pas forcement un achat COMPARABLE.
-#   - sous 20 000 jetons, c'est de la poussiere ;
 #   - au-dela de la moitie du depot de migration, c'est un ACHAT GEANT
 #     DU BLOC DE MIGRATION. Le second diagnostic l'a etabli : environ
 #     1 000 SOL, sur PumpSwap, au slot de la migration. Ce n'est pas un
 #     retrait, c'est un vrai achat - mais il est hors d'echelle et il
-#     n'est pas le signal qu'on cherche.
-# Le depot pump.fun vaut 206,9 M de jetons ; la moitie, 103,45 M.
-DUST_TOKENS = 20_000.0
+#     n'est pas le signal qu'on cherche ;
+#   - sous 0,01 SOL, c'est de la poussiere. Le plancher est en SOL et
+#     non en jetons : apres l'achat geant, qui touche 19 tokens sur 20,
+#     le prix est multiplie par ~180 et 1 SOL n'achete plus que
+#     ~13 000 jetons. Un plancher de 20 000 jetons rejetait 3 474
+#     achats sur 3 639.
 MIGRATION_DEPOSIT = 206_900_000.0
 GIANT_TOKENS = MIGRATION_DEPOSIT / 2
+MIN_SOL = 0.01
+
+# Reserves reconstituees, sans le moindre appel supplementaire. L'etat
+# initial est le meme pour tous les pools pump.fun : 206,9 M de jetons
+# contre 85,16 SOL. Calibre sur le diagnostic 2 - yuud et 6vSq donnent
+# tous deux 85,16 - et verifie sur H22a : 1,0886 SOL predits contre
+# 1,0866 observes.
+POOL_R0 = MIGRATION_DEPOSIT
+POOL_S0 = 85.16
+POOL_K = POOL_R0 * POOL_S0
+# Le depot doit ressembler au depot : +/- 5 % de 206,9 M.
+DEPOSIT_TOLERANCE = 0.05
+# Controle du modele avant de continuer : 3 achats du premier token,
+# compares a la variation reelle de WSOL du pool.
+CONTROL_BUYS = 3
+CONTROL_TOLERANCE = 0.05
 
 # Deux comptes identifies par les diagnostics : ils recoivent du token
 # sur presque tous les pools. Exclus des l'EXTRACTION, en plus de la
@@ -200,7 +231,14 @@ CREDIT_COST = {
     "getTransfersByAddress": 10,
     "getTransactionsForAddress": 100,
     "getTokenSupply": 1,
+    # 1 credit en standard, 10 en archival : on compte le pire.
+    "getTransaction": 10,
 }
+
+# Credits deja consommes par les sondes de diagnostic, a imputer au
+# meme budget. Relus dans sol_run_log ; ces valeurs ne servent que si
+# la relecture echoue.
+DIAG_CREDITS = {"exp2_diag": 100, "exp2_diag2": 32}
 
 _credits = 0
 _credits_before = 0
@@ -216,6 +254,7 @@ _mint_filter: bool | None = None
 _buy_reasons: Counter = Counter()
 _geants: list[dict] = []
 _rapports: list[dict] = []
+_controle: dict = {}
 _incoherences: list[str] = []
 _run_at = ""
 
@@ -404,8 +443,30 @@ def checkpoint(section: str, done: int) -> None:
                                      + _credits})
 
 
-def consumed_before() -> int:
+def diagnostic_credits() -> int:
+    """Les sondes de diagnostic ont depense sur le meme quota."""
     total = 0
+    for mode, connu in DIAG_CREDITS.items():
+        lu = 0
+        try:
+            for row in db.fetch_run_log(mode, "1", 20):
+                payload = row.get("payload") or {}
+                lu += int(rules.to_float(payload.get("credits")))
+        except Exception as error:           # noqa: BLE001
+            log.warning("Relecture de %s impossible (%s) : valeur connue "
+                        "%d utilisee", mode, error, connu)
+            lu = 0
+        if not lu:
+            log.info("%s : aucun credit relu, valeur connue %d utilisee",
+                     mode, connu)
+            lu = connu
+        print(f"  {mode} : {lu} credits imputes au meme budget")
+        total += lu
+    return total
+
+
+def consumed_before() -> int:
+    total = diagnostic_credits()
     for section, key in (("budget", "credits_run"), ("recap", "credits")):
         by_run: dict[str, int] = {}
         try:
@@ -413,7 +474,7 @@ def consumed_before() -> int:
         except Exception as error:           # noqa: BLE001
             log.error("PERTE : relecture de la consommation impossible : %s",
                       error)
-            return 0
+            return total
         for row in rows:
             payload = row.get("payload") or {}
             run_at = str(row.get("run_at"))
@@ -433,6 +494,43 @@ CREATE_SQL = """create table if not exists sol_grad_buys (
   updated_at   timestamptz default now(),
   primary key (mint, wallet)
 );"""
+
+
+def force_rerun_guard() -> bool:
+    """FORCE_RERUN ne vaut que pour UN deploiement, et une seule fois.
+
+    Railway relance la Start Command a chaque redemarrage de conteneur.
+    Sans ce garde-fou, un redemarrage rejouerait toute la collecte avec
+    FORCE_RERUN encore actif et brulerait le plafond. L'identifiant du
+    deploiement est ecrit dans sol_run_log : s'il y figure deja, on
+    s'arrete AVANT le moindre appel.
+    """
+    if not FORCE_RERUN:
+        return True
+    if not DEPLOYMENT_ID:
+        log.error("FORCE_RERUN demande mais RAILWAY_DEPLOYMENT_ID est "
+                  "absent : l'usage unique ne peut pas etre garanti. Arret "
+                  "avant tout appel. Relancer sans FORCE_RERUN, ou fournir "
+                  "l'identifiant du deploiement.")
+        return False
+    try:
+        rows = db.fetch_run_log(RUN_MODE, "run", 50)
+    except Exception as error:               # noqa: BLE001
+        log.error("PERTE : relecture des FORCE_RERUN precedents impossible "
+                  "(%s). Arret avant tout appel plutot que de risquer une "
+                  "seconde collecte complete.", error)
+        return False
+    for row in rows:
+        payload = row.get("payload") or {}
+        if payload.get("force_rerun_deploiement") == DEPLOYMENT_ID:
+            log.error("FORCE_RERUN deja consomme par le deploiement %s le "
+                      "%s. Arret sans aucun appel.", DEPLOYMENT_ID,
+                      row.get("run_at"))
+            return False
+    log_run("run", "force_rerun", {"force_rerun_deploiement": DEPLOYMENT_ID,
+                                   "consomme_le": _run_at})
+    print(f"  FORCE_RERUN consomme pour le deploiement {DEPLOYMENT_ID}")
+    return True
 
 
 def check_tables() -> bool:
@@ -806,125 +904,199 @@ def pool_token_accounts(lines: list[dict], pool: str) -> set[str]:
     return accounts
 
 
-def group_lines(lines: list[dict]) -> dict[str, list[dict]]:
-    """Groupement par signature, OU QU'ELLE SOIT dans la ligne.
-
-    rules.group_by_signature n'accepte que la racine. Le run du 25/09 a
-    ecrit 0 achat sur 800 tokens sans une seule erreur : une ligne dont la
-    signature se trouve ailleurs disparaissait en silence. Le chemin
-    reellement utilise est compte, pour qu'un changement de forme se voie.
-    """
-    groups: dict[str, list[dict]] = defaultdict(list)
-    for line in lines:
-        if not isinstance(line, dict):
-            continue
-        signature, path = rules.extract_signature(line)
-        if not signature:
-            _buy_reasons["ligne sans signature"] += 1
-            continue
-        _buy_reasons["signature via " + path] += 1
-        groups[signature].append(line)
-    return groups
-
-
 def line_slot(line: dict) -> float:
     return rules.to_float(line.get("slot") or line.get("blockSlot"))
 
 
-def buys_in_group(lines: list[dict], pool: str, mint: str,
-                  accounts: set[str], signer: str = "") -> tuple[list[dict],
-                                                                 list[dict]]:
-    """(achats, achats geants) d'une signature : qui sort du pool.
+def chronological(lines: list[dict]) -> list[dict]:
+    """Ordre de chaine : le modele de reserve n'a de sens que dans cet ordre."""
+    return sorted(
+        enumerate(lines),
+        key=lambda item: (rules.line_time(item[1]), line_slot(item[1]),
+                          item[0]))
 
-    Plus aucune exigence de jambe SOL. Avec le filtre `mint`, la reponse
-    ne contient QUE des lignes de ce mint : aucune jambe SOL ne peut
-    partager la signature, et l'exiger revenait a tout rejeter. C'est la
-    cause du "0 achat" du 25/09.
 
-    Les montants sont agreges par (signature, destinataire). Si l'un des
-    destinataires depasse la moitie du depot de migration, c'est un achat
-    geant du bloc de migration : TOUS les destinataires de la signature
-    sortent du rang, pas seulement lui. Le cas 8E6K le montre - une jambe
-    d'environ 1 SOL et une jambe geante, vers deux wallets differents,
-    dans la meme transaction.
+def pool_side(line: dict, pool: str, accounts: set[str],
+              sortant: bool) -> bool:
+    keys = (("fromUserAccount", "fromTokenAccount") if sortant
+            else ("toUserAccount", "toTokenAccount"))
+    for key in keys:
+        value = line.get(key)
+        if isinstance(value, str) and (value == pool or value in accounts):
+            return True
+    return False
+
+
+def direction_of(line: dict, pool: str, accounts: set[str]) -> str:
+    """entree (vers le pool), sortie (depuis le pool), ou interne."""
+    entrant = pool_side(line, pool, accounts, sortant=False)
+    sortant = pool_side(line, pool, accounts, sortant=True)
+    if entrant and sortant:
+        return "interne"
+    if entrant:
+        return "entree"
+    # La reponse ne contient que des lignes concernant le pool : une
+    # sortie dont l'emetteur n'est rattache a personne reste une sortie.
+    return "sortie"
+
+
+def cost_of(reserve: float, tokens: float) -> float | None:
+    """Cout en SOL de x jetons sortis d'une reserve R : k*x / (R*(R-x)).
+
+    None quand le modele ne tient pas - on ne peut pas sortir plus que
+    la reserve. Un cout invente serait pire qu'un cout absent.
     """
-    totals: dict[str, float] = defaultdict(float)
-    when: dict[str, float] = {}
-    slots: dict[str, float] = {}
-    for line in lines:
+    if tokens <= 0 or reserve <= 0 or tokens >= reserve:
+        return None
+    return POOL_K * tokens / (reserve * (reserve - tokens))
+
+
+def looks_like_deposit(amount: float) -> bool:
+    return abs(amount / MIGRATION_DEPOSIT - 1.0) <= DEPOSIT_TOLERANCE
+
+
+def extract_buys(lines: list[dict], pool: str, mint: str, accounts: set[str],
+                 signer: str, reasons: Counter) -> dict:
+    """Rejoue les flux du pool dans l'ordre, et en tire les achats.
+
+    La reserve est mise a jour par TOUS les flux, y compris ceux dont
+    l'achat est ensuite rejete (poussiere, destinataire exclu, achat
+    geant) : une reserve qui ignorerait ces mouvements donnerait des
+    couts faux pour tous les suivants.
+    """
+    ordered = [line for _, line in chronological(lines)]
+    depot = None
+    for line in ordered:
         if line.get("mint") != mint:
             continue
-        _buy_reasons["jambe du mint"] += 1
-        buyer = line.get("toUserAccount")
-        source = line.get("fromUserAccount")
-        account = line.get("fromTokenAccount")
-        if source == pool:
-            form = "emetteur = pool"
-        elif (isinstance(source, str) and source in accounts) or (
-                isinstance(account, str) and account in accounts):
-            form = "emetteur = compte de token du pool"
-        else:
-            # La reponse ne contient que des lignes concernant le pool :
-            # un emetteur inconnu est donc un compte du pool que la
-            # reponse ne rattache a personne. On le compte a part.
-            form = "emetteur non rattache au pool"
-        if not isinstance(buyer, str):
-            _buy_reasons["REJET destinataire absent"] += 1
+        if direction_of(line, pool, accounts) == "entree":
+            depot = line
+            break
+    if depot is None or not looks_like_deposit(rules.amount_of(depot)):
+        reasons["token a reserve inconnue"] += 1
+        return {"reserve": "inconnue", "buys": [], "geants": [],
+                "slot_migration": line_slot(depot) if depot else 0.0,
+                "depot_trouve": depot is not None,
+                "premiere_entree": rules.amount_of(depot) if depot else 0.0,
+                "sol_apres_geant": None, "couts": []}
+
+    reserve = POOL_R0
+    sol_apres_geant = None
+    slot_migration = line_slot(depot)
+    par_signature: dict[str, dict[str, dict]] = defaultdict(dict)
+    ordre: list[str] = []
+    apres_depot = False
+    incoherent = False
+    for line in ordered:
+        if line is depot:
+            apres_depot = True
             continue
-        if buyer in accounts or buyer == pool:
-            _buy_reasons["REJET destinataire = pool (vente ou depot)"] += 1
+        if not apres_depot or line.get("mint") != mint:
+            continue
+        amount = rules.amount_of(line)
+        if amount <= 0:
+            reasons["ligne sans montant"] += 1
+            continue
+        sens = direction_of(line, pool, accounts)
+        if sens == "entree":
+            reserve += amount
+            reasons["vente vers le pool (reserve mise a jour)"] += 1
+            continue
+        if sens == "interne":
+            reasons["mouvement interne au pool"] += 1
+            continue
+        cout = cost_of(reserve, amount)
+        if cout is None:
+            incoherent = True
+            reasons["REJET modele incoherent (sortie >= reserve)"] += 1
+            break
+        reserve -= amount
+        # rules.group_by_signature n'accepte la signature qu'a la racine ;
+        # extract_signature la trouve ou qu'elle soit, et le chemin est
+        # compte pour qu'un changement de forme se voie.
+        signature, chemin = rules.extract_signature(line)
+        if not signature:
+            reasons["ligne sans signature"] += 1
+            continue
+        reasons["signature via " + chemin] += 1
+        buyer = line.get("toUserAccount")
+        if not isinstance(buyer, str):
+            reasons["REJET destinataire absent"] += 1
             continue
         if excluded_wallet(buyer, pool):
-            _buy_reasons["REJET destinataire exclu"] += 1
+            reasons["REJET destinataire exclu"] += 1
             continue
-        _buy_reasons[form] += 1
-        totals[buyer] += rules.amount_of(line)
+        if signature not in par_signature:
+            ordre.append(signature)
+        entry = par_signature[signature].setdefault(
+            buyer, {"tokens": 0.0, "sol": 0.0, "when": 0.0,
+                    "reserve_apres": reserve})
+        entry["tokens"] += amount
+        entry["sol"] += cout
+        entry["reserve_apres"] = reserve
         moment = rules.line_time(line)
-        if moment and (buyer not in when or moment < when[buyer]):
-            when[buyer] = moment
-        slots.setdefault(buyer, line_slot(line))
+        if moment and (not entry["when"] or moment < entry["when"]):
+            entry["when"] = moment
+        entry.setdefault("slot", line_slot(line))
 
-    enormes = sorted(wallet for wallet, amount in totals.items()
-                     if amount > GIANT_TOKENS)
-    if enormes:
-        _buy_reasons["signature d'achat geant (tous destinataires exclus)"] \
-            += 1
-        geants = [{"wallet": wallet, "tokens": totals[wallet],
-                   "part_depot": round(totals[wallet] / MIGRATION_DEPOSIT, 4),
-                   "slot": slots.get(wallet, 0.0),
-                   "quand": when.get(wallet, 0.0),
-                   "est_signataire": wallet == signer,
-                   "avec": sorted(w for w in totals if w != wallet)}
-                  for wallet in enormes]
-        return [], geants
+    if incoherent:
+        return {"reserve": "incoherente", "buys": [], "geants": [],
+                "slot_migration": slot_migration, "depot_trouve": True,
+                "premiere_entree": rules.amount_of(depot),
+                "sol_apres_geant": None, "couts": []}
 
-    found: list[dict] = []
-    for buyer, amount in totals.items():
-        if amount < DUST_TOKENS:
-            _buy_reasons["REJET poussiere (< 20 000 jetons)"] += 1
+    buys: dict[str, dict] = {}
+    geants: list[dict] = []
+    couts: list[float] = []
+    for signature in ordre:
+        wallets = par_signature[signature]
+        enormes = sorted(w for w, data in wallets.items()
+                         if data["tokens"] > GIANT_TOKENS)
+        if enormes:
+            # Cas 8E6K : une jambe geante et une petite dans la meme
+            # signature. Tous les destinataires sortent du rang.
+            reasons["signature d'achat geant (tous destinataires exclus)"] += 1
+            for wallet in enormes:
+                data = wallets[wallet]
+                if sol_apres_geant is None:
+                    sol_apres_geant = POOL_K / data["reserve_apres"]
+                geants.append({
+                    "wallet": wallet, "tokens": data["tokens"],
+                    "sol": data["sol"],
+                    "part_depot": round(data["tokens"] / MIGRATION_DEPOSIT, 4),
+                    "slot": data.get("slot", 0.0), "quand": data["when"],
+                    "est_signataire": wallet == signer,
+                    "avec": sorted(w for w in wallets if w != wallet)})
             continue
-        found.append({"wallet": buyer, "tokens": amount,
-                      "when": when.get(buyer, 0.0)})
-    return found, []
+        for wallet, data in wallets.items():
+            if data["sol"] < MIN_SOL:
+                reasons["REJET poussiere (< 0,01 SOL estime)"] += 1
+                continue
+            couts.append(data["sol"])
+            entry = buys.get(wallet)
+            if entry is None:
+                if len(buys) >= MAX_BUYERS:
+                    continue
+                buys[wallet] = {"first": data["when"], "tokens": data["tokens"],
+                                "sol": data["sol"], "signature": signature}
+            else:
+                entry["tokens"] += data["tokens"]
+                entry["sol"] += data["sol"]
+                if data["when"] and data["when"] < entry["first"]:
+                    entry["first"] = data["when"]
+                    entry["signature"] = signature
 
-
-def migration_line(lines: list[dict], pool: str, mint: str,
-                   accounts: set[str]) -> dict | None:
-    """La ligne du depot de 206,9 M vers le pool : elle donne le slot."""
-    best = None
-    for line in lines:
-        if line.get("mint") != mint:
-            continue
-        destination = line.get("toUserAccount")
-        account = line.get("toTokenAccount")
-        if destination != pool and destination not in accounts and (
-                account not in accounts):
-            continue
-        if rules.amount_of(line) <= GIANT_TOKENS:
-            continue
-        if best is None or line_slot(line) < line_slot(best):
-            best = line
-    return best
+    ordered_buys = sorted(buys.items(), key=lambda item: item[1]["first"])
+    return {"reserve": "ok",
+            "buys": [{"wallet": wallet, "first": data["first"],
+                      "tokens": data["tokens"], "sol": data["sol"],
+                      "signature": data["signature"], "rang": rank}
+                     for rank, (wallet, data) in enumerate(ordered_buys,
+                                                           start=1)],
+            "geants": geants, "slot_migration": slot_migration,
+            "depot_trouve": True,
+            "premiere_entree": rules.amount_of(depot),
+            "sol_apres_geant": sol_apres_geant, "couts": couts}
 
 
 def resales(lines: list[dict], pool: str, mint: str, accounts: set[str],
@@ -937,10 +1109,7 @@ def resales(lines: list[dict], pool: str, mint: str, accounts: set[str],
         seller = line.get("fromUserAccount")
         if seller not in wallets:
             continue
-        destination = line.get("toUserAccount")
-        account = line.get("toTokenAccount")
-        if destination != pool and destination not in accounts and (
-                account not in accounts):
+        if not pool_side(line, pool, accounts, sortant=False):
             continue
         moment = rules.line_time(line)
         if moment and (seller not in first or moment < first[seller]):
@@ -948,13 +1117,23 @@ def resales(lines: list[dict], pool: str, mint: str, accounts: set[str],
     return first
 
 
+def quantiles(values: list[float]) -> dict:
+    if not values:
+        return {"n": 0, "mediane": None, "p10": None, "p90": None}
+    ranked = sorted(values)
+    def at(part: float) -> float:
+        return ranked[min(len(ranked) - 1, int(part * len(ranked)))]
+    return {"n": len(ranked), "mediane": round(statistics.median(ranked), 6),
+            "p10": round(at(0.10), 6), "p90": round(at(0.90), 6)}
+
+
 def token_report(mint: str, pool: str, accounts: set[str], lines: list[dict],
-                 geants: list[dict]) -> dict:
+                 result: dict) -> dict:
     """Le rapport d'un token, a partir des SEULES pages deja lues."""
-    deposit = migration_line(lines, pool, mint, accounts)
-    slot_migration = line_slot(deposit) if deposit else 0.0
-    wallets = {g["wallet"] for g in geants}
-    ventes = resales(lines, pool, mint, accounts, wallets)
+    geants = result["geants"]
+    ventes = resales(lines, pool, mint, accounts,
+                     {g["wallet"] for g in geants})
+    slot_migration = result["slot_migration"]
     detail = []
     for geant in geants:
         ecart = (geant["slot"] - slot_migration
@@ -962,6 +1141,7 @@ def token_report(mint: str, pool: str, accounts: set[str], lines: list[dict],
         detail.append({
             "wallet": geant["wallet"], "part_depot": geant["part_depot"],
             "tokens": round(geant["tokens"], 3),
+            "sol_estime": round(geant["sol"], 4),
             "slot": geant["slot"] or None, "ecart_slot": ecart,
             "est_signataire": geant["est_signataire"],
             "exclus_avec": geant["avec"],
@@ -969,8 +1149,13 @@ def token_report(mint: str, pool: str, accounts: set[str], lines: list[dict],
             "premiere_vente": _iso(ventes[geant["wallet"]])
             if geant["wallet"] in ventes else None})
     return {"mint": mint, "geant": bool(geants),
+            "reserve": result["reserve"],
             "slot_migration": slot_migration or None,
-            "depot_trouve": deposit is not None,
+            "depot_trouve": result["depot_trouve"],
+            "premiere_entree": round(result.get("premiere_entree", 0.0), 3),
+            "sol_apres_geant": round(result["sol_apres_geant"], 4)
+            if result["sol_apres_geant"] else None,
+            "couts_sol": quantiles(result["couts"]),
             "geants": detail}
 
 
@@ -982,6 +1167,10 @@ def buys_of(pool: str, mint: str, graduated: float,
     ce sont les premiers acheteurs qui interessent l'experience. La
     pagination s'arrete des que 100 wallets distincts sont connus.
 
+    L'extraction est REJOUEE sur toutes les lignes lues a chaque page :
+    le cout d'un achat depend de la reserve laissee par les precedents,
+    donc de l'ordre, et une extraction page par page le perdrait.
+
     filters.mint n'a jamais ete valide : un seul essai, puis filtrage du
     mint cote client si la cle est rejetee. Une cle inconnue ferait
     rejeter TOUT l'objet, donc aussi la fenetre blockTime.
@@ -989,12 +1178,15 @@ def buys_of(pool: str, mint: str, graduated: float,
     global _mint_filter
     window = {"blockTime": {"gte": int(graduated),
                             "lte": int(graduated + SIGNAL_WINDOW_S)}}
-    found: dict[str, dict] = {}
     accounts: set[str] = {pool}
     seen: list[dict] = []
-    geants: list[dict] = []
     page_token = None
     stopped = "fenetre couverte"
+    result: dict = {"reserve": "sans ligne", "buys": [], "geants": [],
+                    "slot_migration": 0.0, "depot_trouve": False,
+                    "premiere_entree": 0.0, "sol_apres_geant": None,
+                    "couts": []}
+    reasons: Counter = Counter()
 
     for page in range(BUY_MAX_PAGES):
         config: dict[str, Any] = {"limit": 100, "sortOrder": "asc",
@@ -1023,26 +1215,12 @@ def buys_of(pool: str, mint: str, graduated: float,
             break
         if not rows:
             break
-        _buy_reasons["lignes lues"] += len(rows)
+        reasons["lignes lues"] += len(rows)
         seen.extend(row for row in rows if isinstance(row, dict))
         accounts |= pool_token_accounts(rows, pool)
-        for lines in group_lines(rows).values():
-            buys, enormes = buys_in_group(lines, pool, mint, accounts, signer)
-            geants.extend(enormes)
-            for buy in buys:
-                when = buy["when"] or graduated
-                entry = found.get(buy["wallet"])
-                if entry is None:
-                    if len(found) >= MAX_BUYERS:
-                        continue
-                    found[buy["wallet"]] = {"first": when,
-                                            "tokens": buy["tokens"]}
-                else:
-                    # Un meme wallet peut acheter plusieurs fois dans la
-                    # fenetre : les jetons s'ajoutent, la date recule.
-                    entry["tokens"] += buy["tokens"]
-                    entry["first"] = min(entry["first"], when)
-        if len(found) >= MAX_BUYERS:
+        reasons = Counter({"lignes lues": reasons["lignes lues"]})
+        result = extract_buys(seen, pool, mint, accounts, signer, reasons)
+        if len(result["buys"]) >= MAX_BUYERS:
             stopped = f"rang {MAX_BUYERS} atteint"
             break
         page_token = next_page_token(payload)
@@ -1051,24 +1229,104 @@ def buys_of(pool: str, mint: str, graduated: float,
     else:
         stopped = f"plafond de {BUY_MAX_PAGES} pages"
 
-    rapport = token_report(mint, pool, accounts, seen, geants)
-    if geants:
-        _geants.extend({"mint": mint, **item} for item in rapport["geants"])
-        for item in rapport["geants"]:
-            log.warning("Achat geant du bloc de migration : %s prend "
-                        "%.0f %% du depot de %s (ecart de slot %s, "
-                        "signataire %s, revend %s). %d destinataire(s) de "
-                        "la meme signature sortent du rang.",
-                        item["wallet"][:12], 100 * item["part_depot"],
-                        mint[:8], item["ecart_slot"],
-                        "oui" if item["est_signataire"] else "non",
-                        "oui" if item["revend"] else "non",
-                        len(item["exclus_avec"]))
-    ordered = sorted(found.items(), key=lambda item: item[1]["first"])
-    return ([{"wallet": wallet, "first": data["first"],
-              "tokens": data["tokens"], "rang": rank}
-             for rank, (wallet, data) in enumerate(ordered, start=1)],
-            stopped, rapport)
+    _buy_reasons.update(reasons)
+    rapport = token_report(mint, pool, accounts, seen, result)
+    if result["reserve"] != "ok":
+        log.warning("Token %s : reserve %s (premiere entree %.0f jetons). "
+                    "Exclu de la mesure, compte a part.", mint[:8],
+                    result["reserve"], result.get("premiere_entree", 0.0))
+    for item in rapport["geants"]:
+        _geants.append({"mint": mint, **item})
+        log.warning("Achat geant du bloc de migration : %s prend %.0f %% du "
+                    "depot de %s pour %.1f SOL estimes (ecart de slot %s, "
+                    "signataire %s, revend %s). %d destinataire(s) de la "
+                    "meme signature sortent du rang.", item["wallet"][:12],
+                    100 * item["part_depot"], mint[:8], item["sol_estime"],
+                    item["ecart_slot"],
+                    "oui" if item["est_signataire"] else "non",
+                    "oui" if item["revend"] else "non",
+                    len(item["exclus_avec"]))
+    return result["buys"], stopped, rapport
+
+
+# ---------------------------------------------------------------------------
+# Controle du modele : 3 achats compares a la chaine
+# ---------------------------------------------------------------------------
+
+
+def transaction_of(signature: str) -> Any:
+    if not can_spend("getTransaction"):
+        return "CAPPED"
+    _spend("getTransaction")
+    return helius.rpc("getTransaction",
+                      [signature, {"encoding": "jsonParsed",
+                                   "maxSupportedTransactionVersion": 0}])
+
+
+def observed_sol(transaction: dict, pool: str) -> float | None:
+    """Variation de WSOL du pool dans la transaction. None = introuvable."""
+    total = 0.0
+    trouve = False
+    for mint, owner, delta in rules.deltas_from_raw(transaction):
+        if mint in rules.SOL_MINTS and owner == pool:
+            total += delta
+            trouve = True
+    return total if trouve else None
+
+
+def control_model(pool: str, mint: str, buys: list[dict]) -> dict:
+    """Compare le cout estime a la variation reelle de WSOL du pool.
+
+    Un ecart de plus de 5 % sur un seul achat arrete tout : mieux vaut
+    ne rien mesurer que mesurer avec un modele faux.
+    """
+    comparisons = []
+    for buy in buys[:CONTROL_BUYS]:
+        signature = buy.get("signature")
+        if not signature:
+            continue
+        payload = transaction_of(signature)
+        if payload == "CAPPED":
+            break
+        transaction = (payload or {}).get("result") if isinstance(
+            payload, dict) else None
+        if not isinstance(transaction, dict):
+            log.error("PERTE : getTransaction %s sans reponse exploitable",
+                      str(signature)[:12])
+            comparisons.append({"signature": signature, "erreur": "sans "
+                                "reponse"})
+            continue
+        reel = observed_sol(transaction, pool)
+        if reel is None or reel <= 0:
+            log.warning("Variation de WSOL du pool introuvable sur %s : la "
+                        "comparaison est impossible, pas fausse",
+                        str(signature)[:12])
+            comparisons.append({"signature": signature,
+                                "erreur": "WSOL du pool introuvable"})
+            continue
+        ecart = abs(buy["sol"] - reel) / reel
+        comparisons.append({"signature": signature, "wallet": buy["wallet"],
+                            "estime": round(buy["sol"], 6),
+                            "observe": round(reel, 6),
+                            "ecart": round(ecart, 4)})
+        print(f"    {str(signature)[:12]}.. estime {buy['sol']:.6f} SOL | "
+              f"observe {reel:.6f} SOL | ecart {ecart:.2%}")
+    mesures = [c for c in comparisons if "ecart" in c]
+    pire = max((c["ecart"] for c in mesures), default=None)
+    ok = bool(mesures) and pire is not None and pire <= CONTROL_TOLERANCE
+    if not mesures:
+        log.error("CONTROLE IMPOSSIBLE : aucune comparaison n'a pu etre "
+                  "faite sur %s. Le modele n'est pas valide, la collecte "
+                  "s'arrete.", mint[:8])
+    elif not ok:
+        log.error("CONTROLE ECHOUE : ecart maximal %.2f %% sur %d achat(s), "
+                  "seuil %.0f %%. La collecte s'arrete.", 100 * (pire or 0),
+                  len(mesures), 100 * CONTROL_TOLERANCE)
+    else:
+        print(f"    CONTROLE OK : ecart maximal {pire:.2%} sur "
+              f"{len(mesures)} achat(s), seuil {CONTROL_TOLERANCE:.0%}")
+    return {"mint": mint, "comparaisons": comparisons,
+            "ecart_max": pire, "valide": ok}
 
 
 def journal_geants(taille: int = 200) -> None:
@@ -1089,6 +1347,25 @@ def journal_geants(taille: int = 200) -> None:
             log.error("PERTE : lot %d/%d des rapports par token non ecrit "
                       "dans %s : %s", index, len(lots), RUN_LOG_TABLE, error)
             _incoherences.append(f"rapport par token, lot {index} non ecrit")
+
+
+def circuit_broken(per_token: list[int], examines: int) -> bool:
+    """Au 20e token EXAMINE, la collecte doit avoir rapporte.
+
+    Les tokens a reserve inconnue comptent dans les examines : un modele
+    qui echoue partout arrete le run au lieu de le laisser courir sur
+    800 tokens pour finir a zero.
+    """
+    if examines != CIRCUIT_TOKENS:
+        return False
+    fournis = sum(1 for count in per_token if count >= CIRCUIT_MIN_BUYERS)
+    if fournis >= CIRCUIT_MIN_TOKENS:
+        return False
+    log.error("MESURE VIDE : %d token(s) sur %d examines ont au moins %d "
+              "acheteurs distincts, il en faut %d. Arret : une collecte qui "
+              "ne rapporte rien est un bug, pas un resultat.", fournis,
+              examines, CIRCUIT_MIN_BUYERS, CIRCUIT_MIN_TOKENS)
+    return True
 
 
 def section_1(rows: list[dict], rng: random.Random) -> dict:
@@ -1117,6 +1394,7 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
     written = 0
     buyers_total = 0
     truncated = 0
+    inconnues = 0
     stopped = "termine"
     per_token: list[int] = []
     for index, row in enumerate(todo, start=1):
@@ -1133,32 +1411,43 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
                 stopped = "plafond"
                 break
             continue
+        if rapport["reserve"] != "ok":
+            # Reserve inconnue ou incoherente : le cout n'est pas
+            # calculable, le token est exclu de la mesure et compte.
+            inconnues += 1
+            if circuit_broken(per_token, written + inconnues):
+                stopped = "MESURE VIDE"
+                checkpoint("1", written)
+                break
+            continue
+        if buys and not _controle:
+            print(f"\n  CONTROLE DU MODELE sur {row['mint'][:8]}.. "
+                  f"({CONTROL_BUYS} achats au plus, "
+                  f"{CREDIT_COST['getTransaction']} credits l'appel)")
+            _controle.update(control_model(row["pool"], row["mint"], buys))
+            log_run("1", "controle du modele", _controle)
+            if not _controle.get("valide"):
+                stopped = "CONTROLE ECHOUE"
+                checkpoint("1", written)
+                break
         if buys:
             db.upsert_grad_buys([{
                 "mint": row["mint"], "wallet": buy["wallet"],
                 "jour": row.get("jour"),
                 "first_buy_at": _iso(buy["first"]),
-                # Plus de jambe SOL dans une reponse filtree par mint :
-                # la colonne est laissee VIDE plutot que remplie d'un
-                # zero qui se lirait comme un achat sans contrepartie.
-                "sol_engage": None, "rang": buy["rang"],
+                # ESTIME : il n'y a pas de jambe SOL dans une reponse
+                # filtree par mint. Le cout vient du modele de reserve,
+                # controle sur trois achats avant toute collecte.
+                "sol_engage": round(buy["sol"], 9), "rang": buy["rang"],
                 "updated_at": datetime.now(timezone.utc).isoformat()}
                 for buy in buys])
             buyers_total += len(buys)
         written += 1
         per_token.append(len(buys))
-        if len(per_token) == CIRCUIT_TOKENS:
-            fournis = sum(1 for count in per_token
-                          if count >= CIRCUIT_MIN_BUYERS)
-            if fournis < CIRCUIT_MIN_TOKENS:
-                stopped = "MESURE VIDE"
-                checkpoint("1", written)
-                log.error("MESURE VIDE : %d token(s) sur %d ont au moins %d "
-                          "acheteurs distincts, il en faut %d. Arret : une "
-                          "collecte qui ne rapporte rien est un bug, pas un "
-                          "resultat.", fournis, CIRCUIT_TOKENS,
-                          CIRCUIT_MIN_BUYERS, CIRCUIT_MIN_TOKENS)
-                break
+        if circuit_broken(per_token, written + inconnues):
+            stopped = "MESURE VIDE"
+            checkpoint("1", written)
+            break
         if index % CHECKPOINT_EVERY == 0:
             checkpoint("1", written)
             log.info("  section 1 : %d/%d tokens, %d credits", written,
@@ -1167,12 +1456,27 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
 
     median = statistics.median(per_token) if per_token else 0.0
     fournis = sum(1 for count in per_token if count >= CIRCUIT_MIN_BUYERS)
+    tous_couts = [c for rapport in _rapports
+                  for c in [rapport["couts_sol"]["mediane"]]
+                  if c is not None]
     print(f"\n  {written} token(s) collectes, {buyers_total} achat(s) ecrits "
           f"({stopped})")
     print(f"  achats par token : mediane {median:.1f}, maximum "
           f"{max(per_token) if per_token else 0}")
     print(f"  tokens avec au moins {CIRCUIT_MIN_BUYERS} acheteurs : "
           f"{fournis}/{len(per_token)}")
+    print(f"  tokens a reserve inconnue ou incoherente : {inconnues} "
+          f"(exclus de la mesure)")
+    print(f"  sol_engage est ESTIME par reconstitution des reserves "
+          f"(R0 = {POOL_R0:,.0f} jetons, S0 = {POOL_S0} SOL)")
+    if tous_couts:
+        stats = quantiles(tous_couts)
+        print(f"  cout median par token : mediane {stats['mediane']} SOL | "
+              f"p10 {stats['p10']} | p90 {stats['p90']}")
+    for rapport in _rapports[:3]:
+        print(f"    {rapport['mint'][:8]}.. reserve apres l'achat geant : "
+              f"{rapport['sol_apres_geant']} SOL | couts "
+              f"{rapport['couts_sol']}")
     print(f"  tokens tronques au plafond de pages : {truncated}")
     avec_geant = sum(1 for rapport in _rapports if rapport["geant"])
     part_geant = avec_geant / len(_rapports) if _rapports else 0.0
@@ -1195,6 +1499,13 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
     print("  formes d'achat et rejets :")
     for label, count in sorted(_buy_reasons.items(), key=lambda kv: -kv[1]):
         print(f"    {label:<48} {count}")
+    coherent("la reserve est reconstituable sur la majorite des tokens",
+             inconnues <= max(1, (written + inconnues)) / 2,
+             f"{inconnues} token(s) sans reserve exploitable sur "
+             f"{written + inconnues}")
+    if stopped == "CONTROLE ECHOUE":
+        print("  CONTROLE ECHOUE : le modele de reserve ne reproduit pas la "
+              "chaine. Aucun verdict ne sera rendu sur ces donnees.")
     if stopped == "MESURE VIDE":
         print("  MESURE VIDE : la collecte ne rapporte rien. Aucun verdict "
               "ne sera rendu sur ces donnees.")
@@ -1202,12 +1513,17 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
             "collectes": written, "achats": buyers_total,
             "achats_par_token_median": median,
             "tokens_fournis": fournis,
+            "reserve_inconnue": inconnues,
+            "sol_engage": "ESTIME par reconstitution des reserves "
+                          f"(R0={POOL_R0:.0f}, S0={POOL_S0}, k=S0*R0)",
+            "controle": _controle,
+            "couts_sol_par_token": quantiles(tous_couts),
             "geants": len(_geants),
             "tokens_avec_geant": avec_geant,
             "part_tokens_avec_geant": round(part_geant, 4),
             "sans_depot": sans_depot,
             "tronques": truncated, "arret": stopped,
-            "mesure_vide": stopped == "MESURE VIDE",
+            "mesure_vide": stopped in ("MESURE VIDE", "CONTROLE ECHOUE"),
             "raisons": dict(_buy_reasons),
             "mint_filter": _mint_filter,
             "credits": _credits - _section_start}
@@ -1708,6 +2024,10 @@ def main() -> None:
                                  "refaits" if FORCE_RERUN else "inactif"))
 
     if not check_tables():
+        return
+    if not force_rerun_guard():
+        log_run("run", "arret", {"raison": "FORCE_RERUN non consommable",
+                                 "deploiement": DEPLOYMENT_ID})
         return
     _credits_before = consumed_before()
     print(f"  deja consomme par ce mode : {_credits_before:,} -> reste "

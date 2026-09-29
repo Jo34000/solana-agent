@@ -80,7 +80,8 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 | `DIAG_CALLS` | **Optionnelle**, `exp2_diag` : plafond d'appels Helius (defaut **10**) |
 | `DIAG_SEED` | **Optionnelle**, `exp2_diag` : graine du tirage des tokens examines (defaut **20260928**) |
 | `DIAG2_CALLS` | **Optionnelle**, `exp2_diag2` : plafond d'appels RPC (defaut **6**) |
-| `FORCE_RERUN` | **Optionnelle**, `exp2_wallets` : `true` pour recollecter les tokens deja presents dans `sol_grad_buys` |
+| `FORCE_RERUN` | **Optionnelle**, `exp2_wallets` : `true` pour recollecter les tokens deja presents dans `sol_grad_buys`. **Usage unique par deploiement** |
+| `RAILWAY_DEPLOYMENT_ID` | Fournie par Railway ; **exigee** quand `FORCE_RERUN` est actif, pour garantir cet usage unique |
 | `EXP2_S3_CREDITS` | **Optionnelle**, `exp2_wallets` : plafond de la section 3 (defaut **40 000**) |
 | `STAGE1_SAMPLE` | **Optionnelle**, `exp1_window` : fraction des graduations mesurees en etape 1 (defaut **1.0**) |
 | `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v7` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
@@ -874,7 +875,7 @@ Sans contrepartie SOL, deux garde-fous de **taille** la remplacent :
 
 | Regle | Seuil | Traitement |
 | --- | --- | --- |
-| Poussiere | moins de **20 000 jetons** | ignore |
+| Poussiere | moins de **0,01 SOL** estime | ignore |
 | Achat geant du bloc de migration | plus de **103 450 000 jetons**, soit la moitie du depot de migration (206,9 M) | hors du rang, mais nomme pour ce qu'il est (voir ci-dessous) |
 
 #### Les transferts geants sont de VRAIS achats
@@ -899,13 +900,49 @@ pourcentage de tokens concernes. Aucune table, aucune colonne creee.
 Un token dont la ligne de depot n'est pas dans les pages lues a un ecart
 de slot **inconnu**, pas nul : il est compte a part.
 
-`sol_engage` vaut desormais **NULL**. La colonne l'accepte (aucune
-contrainte `not null`), et l'ecriture de test du demarrage l'ecrit
-reellement a NULL : si la base la refusait, l'experience s'arreterait
-avant la moindre depense au lieu d'inventer un zero.
+#### Le cout en SOL, reconstitue
+
+Un plancher en **jetons** rejetait presque tout : **3 474 achats sur
+3 639**. Apres l'achat geant — qui touche **19 tokens sur 20** — le prix
+est multiplie par environ **180**, et 1 SOL n'achete plus que ~13 000
+jetons. Le plancher est donc exprime en **SOL**, et le cout de chaque
+achat est **estime** en reconstituant les reserves du pool, **sans un
+seul appel supplementaire** :
+
+- etat initial commun a tous les pools pump.fun : **R0 = 206 900 000
+  jetons**, **S0 = 85,16 SOL**, produit constant **k = S0 x R0**.
+  Calibre sur le diagnostic 2 (yuud et 6vSq donnent tous deux 85,16) et
+  verifie sur H22a : 1,0886 SOL predits, 1,0866 observes ;
+- les lignes sont rejouees dans l'**ordre chronologique** a partir du
+  depot : une sortie de `x` jetons coute `k*x / (R*(R-x))`, puis
+  `R -= x` ; une entree (vente) fait `R += x` ;
+- la reserve suit **tous** les flux du pool, y compris ceux dont l'achat
+  est ensuite rejete (poussiere, destinataire exclu, achat geant) — une
+  reserve qui les ignorerait donnerait des couts faux pour tous les
+  suivants ;
+- si la **premiere entree** dans le pool n'est pas le depot d'environ
+  206,9 M (a 5 % pres), le token est dit a **reserve inconnue** : exclu
+  de la mesure et **compte**, jamais devine. Idem si une sortie depasse
+  la reserve — le modele ne tient pas, et on le dit.
+
+`sol_engage` recoit ce cout **estime**. Le journal le dit
+explicitement : la colonne ne peut pas porter cette nuance, le
+`sol_run_log` si.
+
+#### Le controle avant collecte
+
+Sur le **premier token collecte**, trois achats sont compares a la
+**variation reelle de WSOL du pool**, lue par `getTransaction`
+(3 appels au plus). Un ecart de plus de **5 %** sur un seul d'entre eux
+arrete la collecte : mieux vaut ne rien mesurer que mesurer avec un
+modele faux. Si aucune comparaison n'est possible, c'est aussi un arret
+— un controle qui n'a pas eu lieu n'est pas un controle reussi.
+
+Le journal garde, par token, la reserve de SOL reconstituee **apres
+l'achat geant** et la **mediane, le p10 et le p90** du cout des achats.
 
 Le montant en jetons n'est pas stocke : `sol_grad_buys` n'a pas de
-colonne pour lui. Il sert aux deux filtres ci-dessus et au journal.
+colonne pour lui. Il sert aux filtres et au journal.
 
 ### Acheteurs precoces : les 100 premiers
 
@@ -957,7 +994,8 @@ appel. Plafond : **6 appels RPC standard**, aucune ecriture hors
 
 | Garde-fou | Effet |
 | --- | --- |
-| Coupe-circuit, section 1 | au **20e token**, si moins de **15 tokens** ont **10 acheteurs distincts** ou plus, arret immediat : `MESURE VIDE` |
+| Coupe-circuit, section 1 | au **20e token examine** — tokens a reserve inconnue compris — si moins de **15 tokens** ont **10 acheteurs distincts** ou plus, arret immediat : `MESURE VIDE` |
+| Controle du modele | un ecart de plus de 5 % entre cout estime et WSOL observe : arret, `CONTROLE ECHOUE` |
 | Section 2, aucun achat | `MESURE VIDE - pas de verdict`, le placebo n'est pas calcule |
 | Section 2, moins de **30 wallets candidats** | `MESURE VIDE - pas de verdict` : on ne classe pas un top 30 avec moins de 30 |
 | « Aucun signal » | **interdit** tant que `placebo_calcule` n'est pas vrai ; une incoherence est levee sinon |
@@ -968,9 +1006,23 @@ La porte du 25/09 s'est ouverte a **20/20 tokens et 41/41 points**. Si
 `sol_run_log` contient une porte ouverte pour ce mode, la section 0 est
 **sautee** : relire ce verdict coute zero appel, le refaire en coute 35.
 
+### FORCE_RERUN : une seule fois par deploiement
+
+Railway relance la Start Command a **chaque redemarrage de conteneur**.
+Sans garde-fou, un redemarrage rejouerait toute la collecte avec
+`FORCE_RERUN` encore actif. L'identifiant `RAILWAY_DEPLOYMENT_ID` est
+donc ecrit dans `sol_run_log` a la premiere consommation ; s'il y figure
+deja, le mode **s'arrete avant le moindre appel**. Si l'identifiant est
+absent alors que `FORCE_RERUN` est actif, c'est aussi un arret : l'usage
+unique ne peut pas etre garanti, et une bascule silencieuse en mode
+degrade n'est pas une option.
+
 ### Budget
 
-`MAX_CREDITS = 120 000`, **cumule sur toutes les executions** de ce mode :
+`MAX_CREDITS = 120 000`, **cumule sur toutes les executions** de ce mode,
+**sondes de diagnostic comprises** : les credits de `exp2_diag` (100) et
+`exp2_diag2` (32) sont relus dans `sol_run_log` et imputes au meme quota
+— les valeurs connues ne servent que si la relecture echoue.
 la consommation precedente est relue dans `sol_run_log` — les 32 290
 credits du 25/09 comptent — et des points de controle sont ecrits toutes
 les 50 unites, un run tue a la main n'ecrivant jamais son recapitulatif.

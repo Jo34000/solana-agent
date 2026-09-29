@@ -80,6 +80,7 @@ Aucun secret n'est versionne. Toutes les variables sont lues via `os.environ` :
 | `DIAG_CALLS` | **Optionnelle**, `exp2_diag` : plafond d'appels Helius (defaut **10**) |
 | `DIAG_SEED` | **Optionnelle**, `exp2_diag` : graine du tirage des tokens examines (defaut **20260928**) |
 | `DIAG2_CALLS` | **Optionnelle**, `exp2_diag2` : plafond d'appels RPC (defaut **6**) |
+| `FORCE_RERUN` | **Optionnelle**, `exp2_wallets` : `true` pour recollecter les tokens deja presents dans `sol_grad_buys` |
 | `EXP2_S3_CREDITS` | **Optionnelle**, `exp2_wallets` : plafond de la section 3 (defaut **40 000**) |
 | `STAGE1_SAMPLE` | **Optionnelle**, `exp1_window` : fraction des graduations mesurees en etape 1 (defaut **1.0**) |
 | `MIGRATION_ACCOUNTS` | **Optionnelle**, `probe_universe_v3` a `v7` : adresses completes des comptes de migration, separees par des virgules. Absente -> la sonde les re-derive. |
@@ -874,7 +875,29 @@ Sans contrepartie SOL, deux garde-fous de **taille** la remplacent :
 | Regle | Seuil | Traitement |
 | --- | --- | --- |
 | Poussiere | moins de **20 000 jetons** | ignore |
-| Transfert structurel | plus de **103 450 000 jetons**, soit la moitie du depot de migration (206,9 M) | pas un achat : journalise avec le token, le destinataire, le montant, sa part du depot et le fait que le destinataire soit ou non le signataire de la graduation, puis compte sur l'ensemble des tokens |
+| Achat geant du bloc de migration | plus de **103 450 000 jetons**, soit la moitie du depot de migration (206,9 M) | hors du rang, mais nomme pour ce qu'il est (voir ci-dessous) |
+
+#### Les transferts geants sont de VRAIS achats
+
+Le second diagnostic a tranche : environ **1 000 SOL**, sur **PumpSwap**,
+au **slot de la migration**. Ce ne sont pas des retraits. Ils restent
+hors du rang — ce n'est pas le signal cherche — mais ils ne sont plus
+appeles « structurels », et ils sont journalises token par token.
+
+Une meme signature peut servir un achat geant **et** un achat d'environ
+1 SOL vers un autre wallet (cas 8E6K). **Tous les destinataires de cette
+signature** sortent donc du rang, pas seulement le geant.
+
+Le journal, ecrit dans `sol_run_log` par lots de 200 tokens et **sans un
+seul appel supplementaire** — uniquement les pages deja lues — donne par
+token : presence d'un achat geant, le ou les wallets, leur part du depot,
+l'**ecart de slot** par rapport a la migration (le slot de la ligne du
+depot de 206,9 M vers le pool), si le wallet geant **renvoie** des jetons
+au pool dans ces memes pages et a quelle heure, et enfin le nombre et le
+pourcentage de tokens concernes. Aucune table, aucune colonne creee.
+
+Un token dont la ligne de depot n'est pas dans les pages lues a un ecart
+de slot **inconnu**, pas nul : il est compte a part.
 
 `sol_engage` vaut desormais **NULL**. La colonne l'accepte (aucune
 contrainte `not null`), et l'ecriture de test du demarrage l'ecrit

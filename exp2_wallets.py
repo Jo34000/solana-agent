@@ -65,13 +65,22 @@ Ecarts releves APRES le run du 25/09 a 09:23 (800 tokens, 32 290 credits,
      sol_engage vaut NULL, et deux garde-fous de taille remplacent la
      contrepartie SOL : sous 20 000 jetons c'est de la poussiere,
      au-dela de la moitie du depot de migration (103,45 M sur 206,9 M)
-     c'est un transfert structurel, journalise et compte a part.
+     c'est un ACHAT GEANT DU BLOC DE MIGRATION.
+ 10. Le second diagnostic a tranche sur ces transferts geants : environ
+     1 000 SOL, sur PumpSwap, au slot de la migration. Ce sont de VRAIS
+     achats, pas des retraits. Ils restent hors du rang - ils ne sont
+     pas le signal cherche - mais ils sont desormais nommes pour ce
+     qu'ils sont et journalises token par token. Et comme une meme
+     signature peut servir un achat geant ET un achat d'environ 1 SOL
+     vers un autre wallet (cas 8E6K), TOUS les destinataires de cette
+     signature sortent du rang, pas seulement le geant.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import os
 import random
 import statistics
 import time
@@ -108,6 +117,10 @@ GATE_SEED = exp._env_int("EXP2_GATE_SEED", 20260930)
 PAUSE_S = exp._env_float("CLOSE_PAUSE_S", 2.5)
 ROUND_TRIP_COST = exp._env_float("ROUND_TRIP_COST", 0.03)
 RANDOM_SEED = exp._env_int("RANDOM_SEED", 20260929)
+# Relance volontaire : par defaut un token deja collecte est saute, pour
+# qu'un redemarrage de conteneur ne repaye pas ce qui est en base.
+FORCE_RERUN = os.environ.get("FORCE_RERUN", "").strip().lower() in (
+    "1", "true", "yes", "oui")
 
 ENTRY_MCAP_USD = 60_000.0
 SIGNAL_WINDOW_S = 600            # graduation -> +10 min
@@ -141,14 +154,17 @@ CIRCUIT_TOKENS = 20
 CIRCUIT_MIN_BUYERS = 10
 CIRCUIT_MIN_TOKENS = 15
 
-# Un transfert du pool n'est pas forcement un achat.
+# Un transfert du pool n'est pas forcement un achat COMPARABLE.
 #   - sous 20 000 jetons, c'est de la poussiere ;
-#   - au-dela de la moitie du depot de migration, c'est un mouvement
-#     structurel (retrait, redistribution), pas un achat de marche.
+#   - au-dela de la moitie du depot de migration, c'est un ACHAT GEANT
+#     DU BLOC DE MIGRATION. Le second diagnostic l'a etabli : environ
+#     1 000 SOL, sur PumpSwap, au slot de la migration. Ce n'est pas un
+#     retrait, c'est un vrai achat - mais il est hors d'echelle et il
+#     n'est pas le signal qu'on cherche.
 # Le depot pump.fun vaut 206,9 M de jetons ; la moitie, 103,45 M.
 DUST_TOKENS = 20_000.0
 MIGRATION_DEPOSIT = 206_900_000.0
-STRUCTURAL_TOKENS = MIGRATION_DEPOSIT / 2
+GIANT_TOKENS = MIGRATION_DEPOSIT / 2
 
 # Deux comptes identifies par les diagnostics : ils recoivent du token
 # sur presque tous les pools. Exclus des l'EXTRACTION, en plus de la
@@ -198,7 +214,8 @@ _section_cap = 0
 _budget_reached = False
 _mint_filter: bool | None = None
 _buy_reasons: Counter = Counter()
-_structurels: list[dict] = []
+_geants: list[dict] = []
+_rapports: list[dict] = []
 _incoherences: list[str] = []
 _run_at = ""
 
@@ -810,20 +827,30 @@ def group_lines(lines: list[dict]) -> dict[str, list[dict]]:
     return groups
 
 
+def line_slot(line: dict) -> float:
+    return rules.to_float(line.get("slot") or line.get("blockSlot"))
+
+
 def buys_in_group(lines: list[dict], pool: str, mint: str,
-                  accounts: set[str], signer: str = "") -> list[dict]:
-    """Les achats d'une signature : qui sort du pool vers un wallet.
+                  accounts: set[str], signer: str = "") -> tuple[list[dict],
+                                                                 list[dict]]:
+    """(achats, achats geants) d'une signature : qui sort du pool.
 
     Plus aucune exigence de jambe SOL. Avec le filtre `mint`, la reponse
     ne contient QUE des lignes de ce mint : aucune jambe SOL ne peut
     partager la signature, et l'exiger revenait a tout rejeter. C'est la
     cause du "0 achat" du 25/09.
 
-    Les montants sont agreges par (signature, destinataire) : une meme
-    transaction peut envoyer le token en plusieurs jambes.
+    Les montants sont agreges par (signature, destinataire). Si l'un des
+    destinataires depasse la moitie du depot de migration, c'est un achat
+    geant du bloc de migration : TOUS les destinataires de la signature
+    sortent du rang, pas seulement lui. Le cas 8E6K le montre - une jambe
+    d'environ 1 SOL et une jambe geante, vers deux wallets differents,
+    dans la meme transaction.
     """
     totals: dict[str, float] = defaultdict(float)
     when: dict[str, float] = {}
+    slots: dict[str, float] = {}
     for line in lines:
         if line.get("mint") != mint:
             continue
@@ -855,32 +882,100 @@ def buys_in_group(lines: list[dict], pool: str, mint: str,
         moment = rules.line_time(line)
         if moment and (buyer not in when or moment < when[buyer]):
             when[buyer] = moment
+        slots.setdefault(buyer, line_slot(line))
+
+    enormes = sorted(wallet for wallet, amount in totals.items()
+                     if amount > GIANT_TOKENS)
+    if enormes:
+        _buy_reasons["signature d'achat geant (tous destinataires exclus)"] \
+            += 1
+        geants = [{"wallet": wallet, "tokens": totals[wallet],
+                   "part_depot": round(totals[wallet] / MIGRATION_DEPOSIT, 4),
+                   "slot": slots.get(wallet, 0.0),
+                   "quand": when.get(wallet, 0.0),
+                   "est_signataire": wallet == signer,
+                   "avec": sorted(w for w in totals if w != wallet)}
+                  for wallet in enormes]
+        return [], geants
 
     found: list[dict] = []
     for buyer, amount in totals.items():
         if amount < DUST_TOKENS:
             _buy_reasons["REJET poussiere (< 20 000 jetons)"] += 1
             continue
-        if amount > STRUCTURAL_TOKENS:
-            _buy_reasons["REJET transfert structurel"] += 1
-            _structurels.append({"mint": mint, "destinataire": buyer,
-                                 "montant": amount,
-                                 "part_depot": round(
-                                     amount / MIGRATION_DEPOSIT, 4),
-                                 "est_signataire": buyer == signer})
-            log.warning("Transfert structurel : %s recoit %.0f jetons de %s "
-                        "(%.0f %% du depot), signataire de graduation : %s",
-                        buyer[:12], amount, mint[:8],
-                        100 * amount / MIGRATION_DEPOSIT,
-                        "oui" if buyer == signer else "non")
-            continue
         found.append({"wallet": buyer, "tokens": amount,
                       "when": when.get(buyer, 0.0)})
-    return found
+    return found, []
+
+
+def migration_line(lines: list[dict], pool: str, mint: str,
+                   accounts: set[str]) -> dict | None:
+    """La ligne du depot de 206,9 M vers le pool : elle donne le slot."""
+    best = None
+    for line in lines:
+        if line.get("mint") != mint:
+            continue
+        destination = line.get("toUserAccount")
+        account = line.get("toTokenAccount")
+        if destination != pool and destination not in accounts and (
+                account not in accounts):
+            continue
+        if rules.amount_of(line) <= GIANT_TOKENS:
+            continue
+        if best is None or line_slot(line) < line_slot(best):
+            best = line
+    return best
+
+
+def resales(lines: list[dict], pool: str, mint: str, accounts: set[str],
+            wallets: set[str]) -> dict[str, float]:
+    """Premiere revente vers le pool, par wallet, dans les pages LUES."""
+    first: dict[str, float] = {}
+    for line in lines:
+        if line.get("mint") != mint:
+            continue
+        seller = line.get("fromUserAccount")
+        if seller not in wallets:
+            continue
+        destination = line.get("toUserAccount")
+        account = line.get("toTokenAccount")
+        if destination != pool and destination not in accounts and (
+                account not in accounts):
+            continue
+        moment = rules.line_time(line)
+        if moment and (seller not in first or moment < first[seller]):
+            first[seller] = moment
+    return first
+
+
+def token_report(mint: str, pool: str, accounts: set[str], lines: list[dict],
+                 geants: list[dict]) -> dict:
+    """Le rapport d'un token, a partir des SEULES pages deja lues."""
+    deposit = migration_line(lines, pool, mint, accounts)
+    slot_migration = line_slot(deposit) if deposit else 0.0
+    wallets = {g["wallet"] for g in geants}
+    ventes = resales(lines, pool, mint, accounts, wallets)
+    detail = []
+    for geant in geants:
+        ecart = (geant["slot"] - slot_migration
+                 if geant["slot"] and slot_migration else None)
+        detail.append({
+            "wallet": geant["wallet"], "part_depot": geant["part_depot"],
+            "tokens": round(geant["tokens"], 3),
+            "slot": geant["slot"] or None, "ecart_slot": ecart,
+            "est_signataire": geant["est_signataire"],
+            "exclus_avec": geant["avec"],
+            "revend": geant["wallet"] in ventes,
+            "premiere_vente": _iso(ventes[geant["wallet"]])
+            if geant["wallet"] in ventes else None})
+    return {"mint": mint, "geant": bool(geants),
+            "slot_migration": slot_migration or None,
+            "depot_trouve": deposit is not None,
+            "geants": detail}
 
 
 def buys_of(pool: str, mint: str, graduated: float,
-            signer: str = "") -> tuple[list[dict], str]:
+            signer: str = "") -> tuple[list[dict], str, dict]:
     """Les 100 premiers acheteurs du token, de la graduation a +10 min.
 
     Fenetre filtree COTE SERVEUR et lecture du plus ancien au plus recent :
@@ -896,6 +991,8 @@ def buys_of(pool: str, mint: str, graduated: float,
                             "lte": int(graduated + SIGNAL_WINDOW_S)}}
     found: dict[str, dict] = {}
     accounts: set[str] = {pool}
+    seen: list[dict] = []
+    geants: list[dict] = []
     page_token = None
     stopped = "fenetre couverte"
 
@@ -927,9 +1024,12 @@ def buys_of(pool: str, mint: str, graduated: float,
         if not rows:
             break
         _buy_reasons["lignes lues"] += len(rows)
+        seen.extend(row for row in rows if isinstance(row, dict))
         accounts |= pool_token_accounts(rows, pool)
         for lines in group_lines(rows).values():
-            for buy in buys_in_group(lines, pool, mint, accounts, signer):
+            buys, enormes = buys_in_group(lines, pool, mint, accounts, signer)
+            geants.extend(enormes)
+            for buy in buys:
                 when = buy["when"] or graduated
                 entry = found.get(buy["wallet"])
                 if entry is None:
@@ -951,11 +1051,44 @@ def buys_of(pool: str, mint: str, graduated: float,
     else:
         stopped = f"plafond de {BUY_MAX_PAGES} pages"
 
+    rapport = token_report(mint, pool, accounts, seen, geants)
+    if geants:
+        _geants.extend({"mint": mint, **item} for item in rapport["geants"])
+        for item in rapport["geants"]:
+            log.warning("Achat geant du bloc de migration : %s prend "
+                        "%.0f %% du depot de %s (ecart de slot %s, "
+                        "signataire %s, revend %s). %d destinataire(s) de "
+                        "la meme signature sortent du rang.",
+                        item["wallet"][:12], 100 * item["part_depot"],
+                        mint[:8], item["ecart_slot"],
+                        "oui" if item["est_signataire"] else "non",
+                        "oui" if item["revend"] else "non",
+                        len(item["exclus_avec"]))
     ordered = sorted(found.items(), key=lambda item: item[1]["first"])
     return ([{"wallet": wallet, "first": data["first"],
               "tokens": data["tokens"], "rang": rank}
              for rank, (wallet, data) in enumerate(ordered, start=1)],
-            stopped)
+            stopped, rapport)
+
+
+def journal_geants(taille: int = 200) -> None:
+    """Le rapport par token part dans sol_run_log, par lots.
+
+    Aucune table ni colonne n'est creee : tout tient dans le payload. Un
+    echec d'ecriture n'arrete pas le run - les credits sont deja
+    depenses - mais il est signale comme une PERTE, jamais avale.
+    """
+    lots = [_rapports[i:i + taille]
+            for i in range(0, len(_rapports), taille)] or [[]]
+    for index, lot in enumerate(lots, start=1):
+        try:
+            db.insert_run_log(RUN_MODE, _run_at, "1",
+                              f"achats geants (lot {index}/{len(lots)})",
+                              {"tokens": lot})
+        except Exception as error:           # noqa: BLE001
+            log.error("PERTE : lot %d/%d des rapports par token non ecrit "
+                      "dans %s : %s", index, len(lots), RUN_LOG_TABLE, error)
+            _incoherences.append(f"rapport par token, lot {index} non ecrit")
 
 
 def section_1(rows: list[dict], rng: random.Random) -> dict:
@@ -970,6 +1103,10 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
     except Exception as error:               # noqa: BLE001
         log.error("PERTE : relecture de %s impossible : %s", GRAD_BUYS_TABLE,
                   error)
+        deja = set()
+    if FORCE_RERUN and deja:
+        log.warning("FORCE_RERUN actif : les %d token(s) deja collectes sont "
+                    "RECOLLECTES, et leurs lignes reecrites.", len(deja))
         deja = set()
     rng.shuffle(population)
     sample = population[:SAMPLE_TOKENS]
@@ -986,8 +1123,9 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
         if not can_spend("getTransfersByAddress"):
             stopped = "plafond"
             break
-        buys, note = buys_of(row["pool"], row["mint"], _grad_at(row),
-                             row.get("signer") or "")
+        buys, note, rapport = buys_of(row["pool"], row["mint"],
+                                      _grad_at(row), row.get("signer") or "")
+        _rapports.append(rapport)
         if "pages" in note:
             truncated += 1
         if "PERTE" in note or "plafond de credits" in note:
@@ -1036,12 +1174,22 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
     print(f"  tokens avec au moins {CIRCUIT_MIN_BUYERS} acheteurs : "
           f"{fournis}/{len(per_token)}")
     print(f"  tokens tronques au plafond de pages : {truncated}")
-    print(f"  transferts structurels ecartes : {len(_structurels)}")
-    for case in _structurels[:5]:
-        print(f"    {case['mint'][:8]}.. -> {case['destinataire'][:12]}.. "
-              f"{case['montant']:,.0f} jetons ({case['part_depot']:.0%} du "
-              f"depot) | signataire de graduation : "
-              f"{'oui' if case['est_signataire'] else 'non'}")
+    avec_geant = sum(1 for rapport in _rapports if rapport["geant"])
+    part_geant = avec_geant / len(_rapports) if _rapports else 0.0
+    print(f"  tokens avec un achat geant du bloc de migration : "
+          f"{avec_geant}/{len(_rapports)} ({part_geant:.1%})")
+    print(f"  wallets geants ecartes du rang : {len(_geants)}")
+    for case in _geants[:5]:
+        print(f"    {case['mint'][:8]}.. -> {case['wallet'][:12]}.. "
+              f"{case['part_depot']:.0%} du depot | ecart de slot "
+              f"{case['ecart_slot']} | signataire "
+              f"{'oui' if case['est_signataire'] else 'non'} | revend "
+              f"{'oui a ' + str(case['premiere_vente']) if case['revend'] else 'non'}")
+    sans_depot = sum(1 for rapport in _rapports if not rapport["depot_trouve"])
+    if sans_depot:
+        print(f"  {sans_depot} token(s) sans ligne de depot dans les pages "
+              f"lues : leur ecart de slot est inconnu, pas nul")
+    journal_geants()
     print(f"  cle `mint` : "
           f"{'acceptee' if _mint_filter else 'rejetee, filtrage client'}")
     print("  formes d'achat et rejets :")
@@ -1054,8 +1202,10 @@ def section_1(rows: list[dict], rng: random.Random) -> dict:
             "collectes": written, "achats": buyers_total,
             "achats_par_token_median": median,
             "tokens_fournis": fournis,
-            "structurels": len(_structurels),
-            "structurels_detail": _structurels[:50],
+            "geants": len(_geants),
+            "tokens_avec_geant": avec_geant,
+            "part_tokens_avec_geant": round(part_geant, 4),
+            "sans_depot": sans_depot,
             "tronques": truncated, "arret": stopped,
             "mesure_vide": stopped == "MESURE VIDE",
             "raisons": dict(_buy_reasons),
@@ -1554,6 +1704,8 @@ def main() -> None:
     print(f"  echantillon : {', '.join(IN_SAMPLE_DAYS)}")
     print(f"  hors echantillon : {', '.join(OUT_SAMPLE_DAYS)}")
     print(f"  plafond CUMULE : {MAX_CREDITS:,} credits")
+    print("  FORCE_RERUN : " + ("ACTIF, les tokens deja collectes sont "
+                                 "refaits" if FORCE_RERUN else "inactif"))
 
     if not check_tables():
         return
